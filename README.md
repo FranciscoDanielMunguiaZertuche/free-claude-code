@@ -47,9 +47,15 @@ Free Claude Code routes Anthropic Messages API traffic from Claude Code to NVIDI
 
 ## Quick Start
 
-### 1. Install Requirements
+### 1. Install [Claude Code](https://docs.anthropic.com/en/docs/claude-code/getting-started)
 
-Install [Claude Code](https://github.com/anthropics/claude-code), then install `uv` and Python 3.14.
+```bash
+npm install -g @anthropic-ai/claude-code
+```
+
+### 2. Install Runtime Requirements
+
+Install `uv` and Python 3.14.
 
 macOS/Linux:
 
@@ -67,7 +73,7 @@ uv self update
 uv python install 3.14
 ```
 
-### 2. Install The Proxy
+### 3. Install The Proxy
 
 ```bash
 uv tool install git+https://github.com/Alishahryar1/free-claude-code.git
@@ -75,7 +81,7 @@ uv tool install git+https://github.com/Alishahryar1/free-claude-code.git
 
 Use the same command to update the proxy.
 
-### 3. Start The Proxy
+### 4. Start The Proxy
 
 ```bash
 free-claude-code
@@ -90,7 +96,7 @@ Admin UI: http://127.0.0.1:8082/admin
 
 Many terminals make these clickable. Use your configured `PORT` if it is not `8082`.
 
-### 4. Open The Admin UI
+### 5. Open The Admin UI
 
 Open the **Admin UI** URL from the terminal output.
 
@@ -98,11 +104,11 @@ Open the **Admin UI** URL from the terminal output.
   <img src="assets/admin-page.png" alt="Local admin UI for proxy settings" width="700">
 </div>
 
-### 5. Configure Provider And Model
+### 6. Configure Provider And Model
 
 In the Admin UI, paste your provider key, set `MODEL`, set `ANTHROPIC_AUTH_TOKEN`, then click **Validate** and **Apply**. Values are saved to `~/.config/free-claude-code/.env`.
 
-### 6. Run Claude Code
+### 7. Run Claude Code
 
 Point `ANTHROPIC_BASE_URL` at the proxy root. Do not append `/v1`. Use the same `ANTHROPIC_AUTH_TOKEN` you configured in the Admin UI.
 
@@ -344,7 +350,7 @@ Restart the IDE after changing the file.
 
 Claude Code 2.1.126 or later can populate `/model` from this proxy's Gateway `/v1/models` response when `ANTHROPIC_BASE_URL` points here. In **2.1.126–2.1.128** that discovery was automatic; **newer releases** require **`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`** in the same environment as `ANTHROPIC_*`. Omit the flag if you only set models via proxy config and never use `/model` discovery.
 
-Start Claude Code with that variable set (see [Quick Start](#4-run-claude-code)), run `/model`, and choose any discovered provider model.
+Start Claude Code with that variable set (see [Run Claude Code](#7-run-claude-code)), run `/model`, and choose any discovered provider model.
 
 <div align="center">
   <img src="assets/cc-model-picker.png" alt="Claude Code model picker showing gateway models" width="700">
