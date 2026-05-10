@@ -33,7 +33,7 @@ def _load_env_template() -> str:
 
 
 def serve() -> None:
-    """Start the FastAPI server (registered as `free-claude-code` script)."""
+    """Start the FastAPI server (registered as `fcc-server` script)."""
     import uvicorn
 
     from cli.process_registry import kill_all_best_effort
@@ -66,9 +66,7 @@ def init() -> None:
     template = _load_env_template()
     env_file.write_text(template, encoding="utf-8")
     print(f"Config created at {env_file}")
-    print(
-        "Edit it to set your API keys and model preferences, then run: free-claude-code"
-    )
+    print("Edit it to set your API keys and model preferences, then run: fcc-server")
 
 
 def _claude_child_env(
@@ -118,7 +116,7 @@ def launch_claude(argv: Sequence[str] | None = None) -> None:
             f"Free Claude Code proxy is not reachable at {proxy_root_url}: {error}",
             file=sys.stderr,
         )
-        print("Start it in another terminal with: free-claude-code", file=sys.stderr)
+        print("Start it in another terminal with: fcc-server", file=sys.stderr)
         raise SystemExit(1)
 
     args = list(sys.argv[1:] if argv is None else argv)

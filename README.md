@@ -84,7 +84,7 @@ Use the same command to update the proxy.
 ### 4. Start The Proxy
 
 ```bash
-free-claude-code
+fcc-server
 ```
 
 After startup, the terminal prints the proxy and admin URLs:
@@ -307,7 +307,7 @@ For terminal use, prefer the installed launcher:
 fcc-claude
 ```
 
-It points Claude Code at the configured local proxy and refreshes the port/token from config on every new launch. If you change `PORT`, restart `free-claude-code` before opening a new Claude Code session.
+It points Claude Code at the configured local proxy and refreshes the port/token from config on every new launch. If you change `PORT`, restart `fcc-server` before opening a new Claude Code session.
 
 For manual setup, point `ANTHROPIC_BASE_URL` at the proxy root. Do not append `/v1`. Use the same `ANTHROPIC_AUTH_TOKEN` you configured in the Admin UI.
 
@@ -604,9 +604,10 @@ Run them in that order before pushing. CI enforces the same checks.
 
 `pyproject.toml` installs:
 
-- `free-claude-code`: starts the proxy with configured host and port.
+- `fcc-server`: starts the proxy with configured host and port.
 - `fcc-init`: optional file-based config scaffold at `~/.config/free-claude-code/.env`.
 - `fcc-claude`: launches Claude Code with the configured local proxy URL, auth token, and model discovery flag.
+- `free-claude-code`: compatibility alias for `fcc-server`.
 
 ### Extending
 

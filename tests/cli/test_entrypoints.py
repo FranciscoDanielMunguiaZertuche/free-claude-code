@@ -98,22 +98,23 @@ def test_init_skips_if_env_already_exists(tmp_path: Path) -> None:
 
 
 def test_init_prints_next_step_hint(tmp_path: Path) -> None:
-    """init() tells the user to run free-claude-code after editing .env."""
+    """init() tells the user to run fcc-server after editing .env."""
     output, _ = _run_init(tmp_path)
 
-    assert "free-claude-code" in output
+    assert "fcc-server" in output
 
 
-def test_fcc_claude_script_is_registered() -> None:
+def test_cli_scripts_are_registered() -> None:
     pyproject = tomllib.loads(
         (Path(__file__).resolve().parents[2] / "pyproject.toml").read_text(
             encoding="utf-8"
         )
     )
 
-    assert (
-        pyproject["project"]["scripts"]["fcc-claude"] == "cli.entrypoints:launch_claude"
-    )
+    scripts = pyproject["project"]["scripts"]
+    assert scripts["fcc-server"] == "cli.entrypoints:serve"
+    assert scripts["free-claude-code"] == "cli.entrypoints:serve"
+    assert scripts["fcc-claude"] == "cli.entrypoints:launch_claude"
 
 
 def test_claude_child_env_targets_current_proxy_config() -> None:
@@ -200,4 +201,4 @@ def test_launch_claude_unreachable_proxy_exits_with_hint(
     run.assert_not_called()
     captured = capsys.readouterr()
     assert "http://127.0.0.1:9393" in captured.err
-    assert "free-claude-code" in captured.err
+    assert "fcc-server" in captured.err
