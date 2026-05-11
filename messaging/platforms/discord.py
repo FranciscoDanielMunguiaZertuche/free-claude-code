@@ -6,7 +6,6 @@ Implements MessagingPlatform for Discord using discord.py.
 
 import asyncio
 import contextlib
-import tempfile
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, cast
@@ -17,8 +16,13 @@ from core.anthropic import format_user_error_preview
 
 from ..models import IncomingMessage
 from ..rendering.discord_markdown import format_status_discord
-from ..voice import PendingVoiceRegistry, VoiceTranscriptionService
-from .base import MessagingPlatform
+from ..voice import (
+    PendingVoiceRegistry,
+    VoiceNoteRequest,
+    VoiceTranscriptionService,
+    handle_voice_note_request,
+)
+from .base import QueuedMessagingPlatform
 
 AUDIO_EXTENSIONS = (".ogg", ".mp4", ".mp3", ".wav", ".m4a")
 
@@ -76,7 +80,7 @@ else:
     _DiscordClient = None
 
 
-class DiscordPlatform(MessagingPlatform):
+class DiscordPlatform(QueuedMessagingPlatform):
     """
     Discord messaging platform adapter.
 
@@ -179,16 +183,8 @@ class DiscordPlatform(MessagingPlatform):
         if not self._message_handler:
             return False
 
-        status_msg_id = await self.queue_send_message(
-            channel_id,
-            format_status_discord("Transcribing voice note..."),
-            reply_to=str(message.id),
-            fire_and_forget=False,
-        )
-
         user_id = str(message.author.id)
         message_id = str(message.id)
-        await self._register_pending_voice(channel_id, message_id, str(status_msg_id))
         reply_to = (
             str(message.reference.message_id)
             if message.reference and message.reference.message_id
@@ -207,59 +203,34 @@ class DiscordPlatform(MessagingPlatform):
         elif "mp3" in ct or fn.endswith(".mp3"):
             ext = ".mp3"
 
-        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
-            tmp_path = Path(tmp.name)
+        async def _download_to(path: Path) -> None:
+            await attachment.save(str(path))
 
         try:
-            await attachment.save(str(tmp_path))
-
-            transcribed = await self._voice_transcription.transcribe(
-                tmp_path,
-                ct,
+            await handle_voice_note_request(
+                VoiceNoteRequest(
+                    platform="discord",
+                    chat_id=channel_id,
+                    user_id=user_id,
+                    message_id=message_id,
+                    status_text=format_status_discord("Transcribing voice note..."),
+                    status_reply_to=str(message.id),
+                    mime_type=ct,
+                    temp_suffix=ext,
+                    download_to=_download_to,
+                    handler=self._message_handler,
+                    reply_to_message_id=reply_to,
+                    username=message.author.display_name,
+                    raw_event=message,
+                ),
+                queue_send_message=self.queue_send_message,
+                queue_delete_message=self.queue_delete_message,
+                pending_voice=self._pending_voice,
+                transcription=self._voice_transcription,
                 whisper_model=self._whisper_model,
                 whisper_device=self._whisper_device,
+                log_raw_messaging_content=self._log_raw_messaging_content,
             )
-
-            if not await self._is_voice_still_pending(channel_id, message_id):
-                await self.queue_delete_message(channel_id, str(status_msg_id))
-                return True
-
-            await self._pending_voice.complete(
-                channel_id, message_id, str(status_msg_id)
-            )
-
-            incoming = IncomingMessage(
-                text=transcribed,
-                chat_id=channel_id,
-                user_id=user_id,
-                message_id=message_id,
-                platform="discord",
-                reply_to_message_id=reply_to,
-                username=message.author.display_name,
-                raw_event=message,
-                status_message_id=status_msg_id,
-            )
-
-            if self._log_raw_messaging_content:
-                logger.info(
-                    "DISCORD_VOICE: chat_id={} message_id={} transcribed={!r}",
-                    channel_id,
-                    message_id,
-                    (
-                        transcribed[:80] + "..."
-                        if len(transcribed) > 80
-                        else transcribed
-                    ),
-                )
-            else:
-                logger.info(
-                    "DISCORD_VOICE: chat_id={} message_id={} transcribed_len={}",
-                    channel_id,
-                    message_id,
-                    len(transcribed),
-                )
-
-            await self._message_handler(incoming)
             return True
         except ValueError as e:
             await message.reply(format_user_error_preview(e))
@@ -278,9 +249,6 @@ class DiscordPlatform(MessagingPlatform):
                 "Could not transcribe voice note. Please try again or send text."
             )
             return True
-        finally:
-            with contextlib.suppress(OSError):
-                tmp_path.unlink(missing_ok=True)
 
     async def _on_discord_message(self, message: Any) -> None:
         """Handle incoming Discord messages."""
@@ -481,103 +449,6 @@ class DiscordPlatform(MessagingPlatform):
         """Delete multiple messages (best-effort)."""
         for mid in message_ids:
             await self.delete_message(chat_id, mid)
-
-    async def queue_send_message(
-        self,
-        chat_id: str,
-        text: str,
-        reply_to: str | None = None,
-        parse_mode: str | None = None,
-        fire_and_forget: bool = True,
-        message_thread_id: str | None = None,
-    ) -> str | None:
-        """Enqueue a message to be sent."""
-        if not self._limiter:
-            return await self.send_message(
-                chat_id, text, reply_to, parse_mode, message_thread_id
-            )
-
-        async def _send():
-            return await self.send_message(
-                chat_id, text, reply_to, parse_mode, message_thread_id
-            )
-
-        if fire_and_forget:
-            self._limiter.fire_and_forget(_send)
-            return None
-        return await self._limiter.enqueue(_send)
-
-    async def queue_edit_message(
-        self,
-        chat_id: str,
-        message_id: str,
-        text: str,
-        parse_mode: str | None = None,
-        fire_and_forget: bool = True,
-    ) -> None:
-        """Enqueue a message edit."""
-        if not self._limiter:
-            await self.edit_message(chat_id, message_id, text, parse_mode)
-            return
-
-        async def _edit():
-            await self.edit_message(chat_id, message_id, text, parse_mode)
-
-        dedup_key = f"edit:{chat_id}:{message_id}"
-        if fire_and_forget:
-            self._limiter.fire_and_forget(_edit, dedup_key=dedup_key)
-        else:
-            await self._limiter.enqueue(_edit, dedup_key=dedup_key)
-
-    async def queue_delete_message(
-        self,
-        chat_id: str,
-        message_id: str,
-        fire_and_forget: bool = True,
-    ) -> None:
-        """Enqueue a message delete."""
-        if not self._limiter:
-            await self.delete_message(chat_id, message_id)
-            return
-
-        async def _delete():
-            await self.delete_message(chat_id, message_id)
-
-        dedup_key = f"del:{chat_id}:{message_id}"
-        if fire_and_forget:
-            self._limiter.fire_and_forget(_delete, dedup_key=dedup_key)
-        else:
-            await self._limiter.enqueue(_delete, dedup_key=dedup_key)
-
-    async def queue_delete_messages(
-        self,
-        chat_id: str,
-        message_ids: list[str],
-        fire_and_forget: bool = True,
-    ) -> None:
-        """Enqueue a bulk delete."""
-        if not message_ids:
-            return
-
-        if not self._limiter:
-            await self.delete_messages(chat_id, message_ids)
-            return
-
-        async def _bulk():
-            await self.delete_messages(chat_id, message_ids)
-
-        dedup_key = f"del_bulk:{chat_id}:{hash(tuple(message_ids))}"
-        if fire_and_forget:
-            self._limiter.fire_and_forget(_bulk, dedup_key=dedup_key)
-        else:
-            await self._limiter.enqueue(_bulk, dedup_key=dedup_key)
-
-    def fire_and_forget(self, task: Awaitable[Any]) -> None:
-        """Execute a coroutine without awaiting it."""
-        if asyncio.iscoroutine(task):
-            _ = asyncio.create_task(task)
-        else:
-            _ = asyncio.ensure_future(task)
 
     def on_message(
         self,

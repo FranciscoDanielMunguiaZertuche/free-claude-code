@@ -1,5 +1,6 @@
 """Abstract base class for messaging platforms."""
 
+import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from typing import (
@@ -228,3 +229,115 @@ class MessagingPlatform(ABC):
     def is_connected(self) -> bool:
         """Check if the platform is connected."""
         return False
+
+
+class QueuedMessagingPlatform(MessagingPlatform):
+    """Base for adapters that share the app messaging rate limiter contract."""
+
+    queue_parse_mode_default: str | None = None
+    _limiter: Any | None
+
+    async def delete_messages(self, chat_id: str, message_ids: list[str]) -> None:
+        """Delete multiple messages using the adapter's single-message primitive."""
+        for mid in message_ids:
+            await self.delete_message(chat_id, mid)
+
+    async def queue_send_message(
+        self,
+        chat_id: str,
+        text: str,
+        reply_to: str | None = None,
+        parse_mode: str | None = None,
+        fire_and_forget: bool = True,
+        message_thread_id: str | None = None,
+    ) -> str | None:
+        """Enqueue a send operation or call through directly when no limiter exists."""
+        parse_mode = self.queue_parse_mode_default if parse_mode is None else parse_mode
+        if not self._limiter:
+            return await self.send_message(
+                chat_id, text, reply_to, parse_mode, message_thread_id
+            )
+
+        async def _send() -> str:
+            return await self.send_message(
+                chat_id, text, reply_to, parse_mode, message_thread_id
+            )
+
+        if fire_and_forget:
+            self._limiter.fire_and_forget(_send)
+            return None
+        return await self._limiter.enqueue(_send)
+
+    async def queue_edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        text: str,
+        parse_mode: str | None = None,
+        fire_and_forget: bool = True,
+    ) -> None:
+        """Enqueue an edit operation with per-message compaction."""
+        parse_mode = self.queue_parse_mode_default if parse_mode is None else parse_mode
+        if not self._limiter:
+            await self.edit_message(chat_id, message_id, text, parse_mode)
+            return
+
+        async def _edit() -> None:
+            await self.edit_message(chat_id, message_id, text, parse_mode)
+
+        dedup_key = f"edit:{chat_id}:{message_id}"
+        if fire_and_forget:
+            self._limiter.fire_and_forget(_edit, dedup_key=dedup_key)
+        else:
+            await self._limiter.enqueue(_edit, dedup_key=dedup_key)
+
+    async def queue_delete_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        fire_and_forget: bool = True,
+    ) -> None:
+        """Enqueue a delete operation with per-message compaction."""
+        if not self._limiter:
+            await self.delete_message(chat_id, message_id)
+            return
+
+        async def _delete() -> None:
+            await self.delete_message(chat_id, message_id)
+
+        dedup_key = f"del:{chat_id}:{message_id}"
+        if fire_and_forget:
+            self._limiter.fire_and_forget(_delete, dedup_key=dedup_key)
+        else:
+            await self._limiter.enqueue(_delete, dedup_key=dedup_key)
+
+    async def queue_delete_messages(
+        self,
+        chat_id: str,
+        message_ids: list[str],
+        *,
+        fire_and_forget: bool = True,
+    ) -> None:
+        """Enqueue a bulk delete operation with coarse content compaction."""
+        if not message_ids:
+            return
+
+        if not self._limiter:
+            await self.delete_messages(chat_id, message_ids)
+            return
+
+        async def _bulk() -> None:
+            await self.delete_messages(chat_id, message_ids)
+
+        dedup_key = f"del_bulk:{chat_id}:{hash(tuple(message_ids))}"
+        if fire_and_forget:
+            self._limiter.fire_and_forget(_bulk, dedup_key=dedup_key)
+        else:
+            await self._limiter.enqueue(_bulk, dedup_key=dedup_key)
+
+    def fire_and_forget(self, task: Awaitable[Any]) -> None:
+        """Execute a coroutine without awaiting it."""
+        if asyncio.iscoroutine(task):
+            _ = asyncio.create_task(task)
+        else:
+            _ = asyncio.ensure_future(task)
