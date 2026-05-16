@@ -179,6 +179,7 @@ class SSEBuilder:
         self.model = model
         self.input_tokens = input_tokens
         self._log_raw_events = log_raw_events
+        self._message_start_emitted = False
         self.blocks = ContentBlockManager()
         self._accumulated_text_parts: list[str] = []
         self._accumulated_reasoning_parts: list[str] = []
@@ -190,6 +191,9 @@ class SSEBuilder:
         return event_str
 
     def message_start(self) -> str:
+        if self._message_start_emitted:
+            return ""
+        self._message_start_emitted = True
         safe_input = _safe_usage_int(self.input_tokens)
         usage = {"input_tokens": safe_input, "output_tokens": 1}
         return self._format_event(

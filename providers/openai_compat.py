@@ -368,8 +368,6 @@ class OpenAIChatTransport(BaseProvider):
             body=provider_chat_body_snapshot(body),
         )
 
-        yield sse.message_start()
-
         think_parser = ThinkTagParser()
         heuristic_parser = HeuristicToolParser()
         finish_reason = None
@@ -380,6 +378,7 @@ class OpenAIChatTransport(BaseProvider):
         async with self._global_rate_limiter.concurrency_slot():
             try:
                 stream, body = await self._create_stream(body)
+                yield sse.message_start()
                 tool_argument_aliases = self._tool_argument_aliases(body)
                 async for chunk in stream:
                     if getattr(chunk, "usage", None):
@@ -497,6 +496,7 @@ class OpenAIChatTransport(BaseProvider):
                     error_message=error_message,
                     mapped_error_type=type(mapped_e).__name__,
                 )
+                yield sse.message_start()
                 for event in sse.close_all_blocks():
                     yield event
                 if sse.blocks.has_emitted_tool_block():
