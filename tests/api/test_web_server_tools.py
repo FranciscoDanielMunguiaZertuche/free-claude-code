@@ -100,7 +100,7 @@ def test_service_rejects_forced_server_tool_on_openai_when_disabled():
     assert settings.enable_web_server_tools is False
     service = ClaudeProxyService(
         settings,
-        provider_getter=lambda _: MagicMock(),
+        provider_getter=lambda _, **_kw: MagicMock(),
         model_router=FixedProviderModelRouter(settings, "nvidia_nim"),
     )
     request = MessagesRequest(
@@ -583,7 +583,7 @@ def test_service_rejects_listed_server_tools_on_openai_chat() -> None:
     settings = Settings()
     service = ClaudeProxyService(
         settings,
-        provider_getter=lambda _: MagicMock(),
+        provider_getter=lambda _, **_kw: MagicMock(),
         model_router=FixedProviderModelRouter(settings, "nvidia_nim"),
     )
     request = MessagesRequest(
@@ -608,7 +608,7 @@ def test_listed_server_tools_routed_on_open_router() -> None:
     mock_provider.stream_response = fake_stream
     service = ClaudeProxyService(
         settings,
-        provider_getter=lambda _: mock_provider,
+        provider_getter=lambda _, **_kw: mock_provider,
         model_router=FixedProviderModelRouter(settings, "open_router"),
     )
     request = MessagesRequest(

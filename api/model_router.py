@@ -34,13 +34,31 @@ class RoutedTokenCountRequest:
     resolved: ResolvedModel
 
 
+def _request_has_images(request: MessagesRequest) -> bool:
+    """Return True if any message in the request contains an image block."""
+    for msg in request.messages:
+        content = msg.content
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "image":
+                        return True
+                elif hasattr(block, "type") and block.type == "image":
+                    return True
+        if isinstance(content, dict) and content.get("type") == "image":
+            return True
+    return False
+
+
 class ModelRouter:
     """Resolve incoming Claude model names to configured provider/model pairs."""
 
     def __init__(self, settings: Settings):
         self._settings = settings
 
-    def resolve(self, claude_model_name: str) -> ResolvedModel:
+    def resolve(
+        self, claude_model_name: str, *, has_images: bool = False
+    ) -> ResolvedModel:
         (
             direct_provider_id,
             direct_provider_model,
@@ -67,13 +85,19 @@ class ModelRouter:
                 thinking_enabled=thinking_enabled,
             )
 
-        provider_model_ref = self._settings.resolve_model(claude_model_name)
+        provider_model_ref = self._settings.resolve_model(
+            claude_model_name, has_images=has_images
+        )
         thinking_enabled = self._settings.resolve_thinking(claude_model_name)
         provider_id = Settings.parse_provider_type(provider_model_ref)
         provider_model = Settings.parse_model_name(provider_model_ref)
         if provider_model != claude_model_name:
+            label = " (vision)" if has_images else ""
             logger.debug(
-                "MODEL MAPPING: '{}' -> '{}'", claude_model_name, provider_model
+                "MODEL MAPPING{}: '{}' -> '{}'",
+                label,
+                claude_model_name,
+                provider_model,
             )
         return ResolvedModel(
             original_model=claude_model_name,
@@ -109,7 +133,8 @@ class ModelRouter:
         self, request: MessagesRequest
     ) -> RoutedMessagesRequest:
         """Return an internal routed request context."""
-        resolved = self.resolve(request.model)
+        has_images = _request_has_images(request)
+        resolved = self.resolve(request.model, has_images=has_images)
         routed = request.model_copy(deep=True)
         routed.model = resolved.provider_model
         return RoutedMessagesRequest(request=routed, resolved=resolved)

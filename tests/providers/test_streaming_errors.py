@@ -346,8 +346,11 @@ class TestStreamingExceptionHandling:
     async def test_reasoning_only_stream_emits_placeholder_text(self):
         """When the model streams only ``reasoning_content`` (no ``content``), add text block.
 
-        NIM / some templates may emit no main ``content``; a minimal text block matches
-        the empty-body placeholder and helps clients that expect a text segment.
+                NIM / some templates may emit no main ``content``; a minimal text block matches
+                the empty-body placeholder and helps clients that expect a text segment.
+
+        NIM reasoning_content is emitted as text because NIM models with
+        ``thinking=True`` place the entire response in reasoning_content.
         """
         provider = _make_provider_with_thinking_enabled(True)
         request = _make_request()
@@ -369,14 +372,15 @@ class TestStreamingExceptionHandling:
             ),
         ):
             events = await _collect_stream(provider, request)
-        event_text = "".join(events)
-        assert "thinking_delta" in event_text
+            event_text = "".join(events)
+        assert "redacted_thinking" not in event_text
+        assert "reasoning only from provider" in event_text
         assert '"text_delta"' in event_text
         assert "message_stop" in event_text
 
     @pytest.mark.asyncio
     async def test_stream_with_thinking_content(self):
-        """Thinking content via think tags is emitted as thinking blocks."""
+        """Thinking content via think tags is emitted as text by NIM."""
         provider = _make_provider()
         request = _make_request()
 
@@ -401,13 +405,13 @@ class TestStreamingExceptionHandling:
             events = await _collect_stream(provider, request)
 
         event_text = "".join(events)
-        assert "thinking" in event_text
+        assert "redacted_thinking" not in event_text
         assert "reasoning" in event_text
         assert "answer" in event_text
 
     @pytest.mark.asyncio
     async def test_stream_with_reasoning_content_field(self):
-        """reasoning_content delta field is emitted as thinking block."""
+        """reasoning_content delta field is emitted as text by NIM."""
         provider = _make_provider()
         request = _make_request()
 
@@ -433,7 +437,7 @@ class TestStreamingExceptionHandling:
             events = await _collect_stream(provider, request)
 
         event_text = "".join(events)
-        assert "thinking_delta" in event_text
+        assert "redacted_thinking" not in event_text
         assert "I think..." in event_text
         assert "The answer" in event_text
 
@@ -466,8 +470,11 @@ class TestStreamingExceptionHandling:
 
         event_text = "".join(events)
         assert "thinking_delta" not in event_text
-        assert "I think..." not in event_text
-        assert "secret" not in event_text
+        assert "redacted_thinking" not in event_text
+        assert "I think..." in event_text
+        assert (
+            "secret" not in event_text
+        )  # think-tag content suppressed when thinking disabled
         assert "The answer" in event_text
 
     @pytest.mark.asyncio

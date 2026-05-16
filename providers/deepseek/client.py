@@ -35,7 +35,7 @@ class DeepSeekProvider(AnthropicMessagesTransport):
         return {
             "Accept": "text/event-stream",
             "Content-Type": "application/json",
-            "x-api-key": self._api_key,
+            "Authorization": f"Bearer {self._api_key}",
         }
 
     async def _send_model_list_request(self) -> httpx.Response:

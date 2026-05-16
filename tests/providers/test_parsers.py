@@ -508,3 +508,80 @@ def test_heuristic_tool_parser_malformed_function_tag(malformed_text):
     _filtered, tools = parser.feed(malformed_text)
     tools.extend(parser.flush())
     # Should not crash; may or may not detect a tool depending on regex match
+
+
+class TestXmlToolCallParser:
+    """Tests for HeuristicToolParser.extract_xml_tool_calls static method."""
+
+    def test_single_xml_tool_call(self):
+        text = "<Read><filePath>/tmp/test.txt</filePath></Read>"
+        _remaining, tools = HeuristicToolParser.extract_xml_tool_calls(text)
+        assert len(tools) == 1
+        assert tools[0]["name"] == "Read"
+        assert tools[0]["input"]["filePath"] == "/tmp/test.txt"
+        assert _remaining == ""
+
+    def test_multiple_params(self):
+        text = "<Edit><filePath>/tmp/test.txt</filePath><oldString>hello</oldString><newString>world</newString></Edit>"
+        _remaining, tools = HeuristicToolParser.extract_xml_tool_calls(text)
+        assert len(tools) == 1
+        assert tools[0]["name"] == "Edit"
+        assert tools[0]["input"]["filePath"] == "/tmp/test.txt"
+        assert tools[0]["input"]["oldString"] == "hello"
+        assert tools[0]["input"]["newString"] == "world"
+
+    def test_surrounding_text_stripped(self):
+        text = (
+            "I will read the file.\n<Read><filePath>/tmp/test.txt</filePath></Read>\n"
+        )
+        _remaining, tools = HeuristicToolParser.extract_xml_tool_calls(text)
+        assert len(tools) == 1
+        assert tools[0]["name"] == "Read"
+
+    def test_unknown_tag_ignored(self):
+        text = "<foo><bar>baz</bar></foo>"
+        _remaining, tools = HeuristicToolParser.extract_xml_tool_calls(text)
+        assert len(tools) == 0
+
+    def test_known_tools_only(self):
+        text = "<Bash><command>ls -la</command></Bash>"
+        _remaining, tools = HeuristicToolParser.extract_xml_tool_calls(text)
+        assert len(tools) == 1
+        assert tools[0]["name"] == "Bash"
+        assert tools[0]["input"]["command"] == "ls -la"
+
+    def test_multiple_xml_tool_calls(self):
+        text = "<Grep><pattern>class.*Provider</pattern><include>*.py</include></Grep>"
+        _remaining, tools = HeuristicToolParser.extract_xml_tool_calls(text)
+        assert len(tools) == 1
+        assert tools[0]["name"] == "Grep"
+        assert tools[0]["input"]["pattern"] == "class.*Provider"
+        assert tools[0]["input"]["include"] == "*.py"
+
+    def test_no_params_ignored(self):
+        text = "<Read></Read>"
+        _remaining, tools = HeuristicToolParser.extract_xml_tool_calls(text)
+        assert len(tools) == 0
+
+    def test_empty_input(self):
+        _remaining, tools = HeuristicToolParser.extract_xml_tool_calls("")
+        assert tools == []
+        assert _remaining == ""
+
+    def test_no_xml_tool_calls(self):
+        text = "Just plain text without any tool calls."
+        _remaining, tools = HeuristicToolParser.extract_xml_tool_calls(text)
+        assert tools == []
+
+    def test_nim_real_format(self):
+        text = "<Read><filePath>/etc/hostname</filePath></Read>"
+        _remaining, tools = HeuristicToolParser.extract_xml_tool_calls(text)
+        assert len(tools) == 1
+        assert tools[0]["name"] == "Read"
+        assert tools[0]["input"]["filePath"] == "/etc/hostname"
+
+    def test_tool_use_has_correct_type_and_id(self):
+        text = "<Bash><command>echo hi</command></Bash>"
+        _remaining, tools = HeuristicToolParser.extract_xml_tool_calls(text)
+        assert tools[0]["type"] == "tool_use"
+        assert tools[0]["id"].startswith("toolu_xml_")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import traceback
 import uuid
 from collections.abc import AsyncIterator, Callable
@@ -31,10 +32,47 @@ from .web_tools.streaming import stream_web_server_tool_response
 
 TokenCounter = Callable[[list[Any], str | list[Any] | None, list[Any] | None], int]
 
-ProviderGetter = Callable[[str], BaseProvider]
+ProviderGetter = Callable[..., BaseProvider]
 
 # Providers that use ``/chat/completions`` + Anthropic-to-OpenAI conversion (not native Messages).
 _OPENAI_CHAT_UPSTREAM_IDS = frozenset({"nvidia_nim", "opencode", "opencode_go", "zai"})
+
+
+async def _with_heartbeat(body: AsyncIterator[str]) -> AsyncIterator[str]:
+    """Wrap an SSE iterator to emit periodic ``:heartbeat`` comments.
+
+    Keeps idle connections alive through proxies / Cloudflare Warp so
+    the client does not see a dropped stream during long prefill.
+    """
+    import asyncio
+
+    queue: asyncio.Queue[str] = asyncio.Queue()
+    done = False
+
+    async def _pump() -> None:
+        nonlocal done
+        try:
+            async for chunk in body:
+                await queue.put(chunk)
+        finally:
+            done = True
+            await queue.put("__done__")
+
+    task = asyncio.create_task(_pump())
+    try:
+        while True:
+            try:
+                chunk = await asyncio.wait_for(queue.get(), timeout=5.0)
+            except TimeoutError:
+                yield ":heartbeat\n\n"
+                continue
+            if chunk == "__done__":
+                break
+            yield chunk
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 def anthropic_sse_streaming_response(
@@ -42,7 +80,7 @@ def anthropic_sse_streaming_response(
 ) -> StreamingResponse:
     """Return a :class:`StreamingResponse` for Anthropic-style SSE streams."""
     return StreamingResponse(
-        body,
+        _with_heartbeat(body),
         media_type="text/event-stream",
         headers=ANTHROPIC_SSE_RESPONSE_HEADERS,
     )
@@ -149,7 +187,10 @@ class ClaudeProxyService:
                 return optimized
             logger.debug("No optimization matched, routing to provider")
 
-            provider = self._provider_getter(routed.resolved.provider_id)
+            provider = self._provider_getter(
+                routed.resolved.provider_id,
+                claude_model=routed.resolved.original_model,
+            )
             provider.preflight_stream(
                 routed.request,
                 thinking_enabled=routed.resolved.thinking_enabled,

@@ -35,7 +35,21 @@ PROVIDER_DESCRIPTORS: dict[str, ProviderDescriptor] = PROVIDER_CATALOG
 def _create_nvidia_nim(config: ProviderConfig, settings: Settings) -> BaseProvider:
     from providers.nvidia_nim import NvidiaNimProvider
 
-    return NvidiaNimProvider(config, nim_settings=settings.nim)
+    fallback_keys: list[str] = []
+    if settings.nvidia_nim_api_key_fallback:
+        fallback_keys.append(settings.nvidia_nim_api_key_fallback)
+    if settings.nvidia_nim_api_key_fallback2:
+        fallback_keys.append(settings.nvidia_nim_api_key_fallback2)
+    nim_settings = settings.nim
+    if settings.nvidia_nim_reasoning_effort:
+        nim_settings = nim_settings.model_copy(
+            update={"reasoning_effort": settings.nvidia_nim_reasoning_effort}
+        )
+    return NvidiaNimProvider(
+        config,
+        nim_settings=nim_settings,
+        fallback_api_keys=fallback_keys or None,
+    )
 
 
 def _create_open_router(config: ProviderConfig, _settings: Settings) -> BaseProvider:
@@ -136,6 +150,37 @@ def _string_attr(settings: Settings, attr_name: str | None, default: str = "") -
     return value if isinstance(value, str) else default
 
 
+def _nvidia_nim_api_key_for_model(settings: Settings, claude_model: str) -> str:
+    """Select NVIDIA NIM API key based on Claude model tier.
+
+    Per-tier keys (``NVIDIA_NIM_API_KEY_SONNET``, ``NVIDIA_NIM_API_KEY_OPUS``)
+    take precedence over the base ``NVIDIA_NIM_API_KEY``.
+    """
+    name_lower = claude_model.lower()
+    if "opus" in name_lower and settings.nvidia_nim_api_key_opus:
+        return settings.nvidia_nim_api_key_opus
+    if "sonnet" in name_lower and settings.nvidia_nim_api_key_sonnet:
+        return settings.nvidia_nim_api_key_sonnet
+    return settings.nvidia_nim_api_key
+
+
+def _nvidia_nim_cache_key(
+    provider_id: str, claude_model: str, settings: Settings
+) -> str:
+    """Compute the provider cache key for NVIDIA NIM, including the API key tier.
+
+    Different API keys need separate provider/client instances because the
+    OpenAI client holds the key at construction time.
+    """
+    key = _nvidia_nim_api_key_for_model(settings, claude_model)
+    base_key = settings.nvidia_nim_api_key
+    if key and key != base_key and key == settings.nvidia_nim_api_key_opus:
+        return f"{provider_id}:opus"
+    if key and key != base_key and key == settings.nvidia_nim_api_key_sonnet:
+        return f"{provider_id}:sonnet"
+    return provider_id
+
+
 def _credential_for(descriptor: ProviderDescriptor, settings: Settings) -> str:
     if descriptor.static_credential is not None:
         return descriptor.static_credential
@@ -156,9 +201,14 @@ def _require_credential(descriptor: ProviderDescriptor, credential: str) -> None
 
 
 def build_provider_config(
-    descriptor: ProviderDescriptor, settings: Settings
+    descriptor: ProviderDescriptor,
+    settings: Settings,
+    *,
+    api_key_override: str | None = None,
 ) -> ProviderConfig:
-    credential = _credential_for(descriptor, settings)
+    credential = (
+        api_key_override if api_key_override else _credential_for(descriptor, settings)
+    )
     _require_credential(descriptor, credential)
     base_url = _string_attr(
         settings, descriptor.base_url_attr, descriptor.default_base_url or ""
@@ -180,7 +230,12 @@ def build_provider_config(
     )
 
 
-def create_provider(provider_id: str, settings: Settings) -> BaseProvider:
+def create_provider(
+    provider_id: str,
+    settings: Settings,
+    *,
+    api_key_override: str | None = None,
+) -> BaseProvider:
     descriptor = PROVIDER_DESCRIPTORS.get(provider_id)
     if descriptor is None:
         supported = "', '".join(PROVIDER_DESCRIPTORS)
@@ -188,7 +243,9 @@ def create_provider(provider_id: str, settings: Settings) -> BaseProvider:
             f"Unknown provider_type: '{provider_id}'. Supported: '{supported}'"
         )
 
-    config = build_provider_config(descriptor, settings)
+    config = build_provider_config(
+        descriptor, settings, api_key_override=api_key_override
+    )
     factory = PROVIDER_FACTORIES.get(provider_id)
     if factory is None:
         raise AssertionError(f"Unhandled provider descriptor: {provider_id}")
@@ -270,14 +327,36 @@ class ProviderRegistry:
         self._model_infos_by_provider: dict[str, dict[str, ProviderModelInfo]] = {}
         self._model_list_refresh_task: asyncio.Task[None] | None = None
 
-    def is_cached(self, provider_id: str) -> bool:
+    def is_cached(
+        self,
+        provider_id: str,
+        *,
+        claude_model: str | None = None,
+        settings: Settings | None = None,
+    ) -> bool:
         """Return whether a provider for this id is already in the cache."""
-        return provider_id in self._providers
+        cache_key = provider_id
+        if provider_id == "nvidia_nim" and claude_model and settings:
+            cache_key = _nvidia_nim_cache_key(provider_id, claude_model, settings)
+        return cache_key in self._providers
 
-    def get(self, provider_id: str, settings: Settings) -> BaseProvider:
-        if provider_id not in self._providers:
-            self._providers[provider_id] = create_provider(provider_id, settings)
-        return self._providers[provider_id]
+    def get(
+        self,
+        provider_id: str,
+        settings: Settings,
+        *,
+        claude_model: str | None = None,
+    ) -> BaseProvider:
+        api_key_override: str | None = None
+        cache_key = provider_id
+        if provider_id == "nvidia_nim" and claude_model:
+            api_key_override = _nvidia_nim_api_key_for_model(settings, claude_model)
+            cache_key = _nvidia_nim_cache_key(provider_id, claude_model, settings)
+        if cache_key not in self._providers:
+            self._providers[cache_key] = create_provider(
+                provider_id, settings, api_key_override=api_key_override
+            )
+        return self._providers[cache_key]
 
     def cache_model_ids(self, provider_id: str, model_ids: Iterable[str]) -> None:
         """Store a provider model-list result for later instant API responses."""

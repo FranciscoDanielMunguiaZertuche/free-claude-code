@@ -289,10 +289,7 @@ class TestBuildRequestBody:
         extra = body["extra_body"]
         assert extra["chat_template_kwargs"] == {
             "thinking": True,
-            "enable_thinking": True,
-            "reasoning_budget": body["max_tokens"],
         }
-        assert "reasoning_budget" not in extra
 
     def test_clone_body_without_chat_template(self):
         body = {
@@ -301,8 +298,6 @@ class TestBuildRequestBody:
                 "chat_template": "custom_template",
                 "chat_template_kwargs": {
                     "thinking": True,
-                    "enable_thinking": True,
-                    "reasoning_budget": 100,
                 },
                 "ignore_eos": False,
             },
@@ -314,8 +309,6 @@ class TestBuildRequestBody:
         assert "chat_template" not in cloned["extra_body"]
         assert cloned["extra_body"]["chat_template_kwargs"] == {
             "thinking": True,
-            "enable_thinking": True,
-            "reasoning_budget": 100,
         }
         assert cloned["extra_body"]["ignore_eos"] is False
         assert body["extra_body"]["chat_template"] == "custom_template"
@@ -357,10 +350,11 @@ class TestBuildRequestBody:
         }
 
         body = build_request_body(req, NimSettings(), thinking_enabled=True)
+        # When existing chat_template_kwargs from user has enable_thinking=False,
+        # we don't forcibly override. setdefault only adds missing keys.
         assert body["extra_body"]["chat_template_kwargs"] == {
             "enable_thinking": False,
             "custom": "value",
-            "reasoning_budget": body["max_tokens"],
         }
 
     def test_chat_template_fields_present_for_mistral_model(self):
@@ -382,8 +376,6 @@ class TestBuildRequestBody:
         extra = body.get("extra_body", {})
         assert extra["chat_template_kwargs"] == {
             "thinking": True,
-            "enable_thinking": True,
-            "reasoning_budget": body["max_tokens"],
         }
         assert extra["chat_template"] == "custom_template"
 
@@ -409,7 +401,6 @@ class TestBuildRequestBody:
             "reasoning_split",
             "return_tokens_as_token_ids",
             "include_reasoning",
-            "reasoning_effort",
         ):
             assert param not in extra
 
