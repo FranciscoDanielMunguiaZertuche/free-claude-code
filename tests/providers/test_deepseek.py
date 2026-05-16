@@ -68,9 +68,9 @@ def test_init(deepseek_config):
     assert mock_client.called
 
 
-def test_request_headers_includes_x_api_key(deepseek_provider):
+def test_request_headers_includes_auth_bearer(deepseek_provider):
     h = deepseek_provider._request_headers()
-    assert h["x-api-key"] == "test_deepseek_key"
+    assert h["Authorization"] == "Bearer test_deepseek_key"
     assert h["Content-Type"] == "application/json"
     assert h["Accept"] == "text/event-stream"
 

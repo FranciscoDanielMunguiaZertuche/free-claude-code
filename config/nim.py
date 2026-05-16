@@ -35,6 +35,7 @@ class NimSettings(BaseModel):
     min_tokens: int = Field(0, ge=0, description="Minimum tokens in the response.")
     chat_template: str | None = None
     request_id: str | None = None
+    reasoning_effort: str | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -108,7 +109,9 @@ class NimSettings(BaseModel):
                 f"{info.field_name} must be an int or empty/None."
             ) from err
 
-    @field_validator("stop", "chat_template", "request_id", mode="before")
+    @field_validator(
+        "stop", "chat_template", "request_id", "reasoning_effort", mode="before"
+    )
     @classmethod
     def parse_optional_str(cls, v, info: ValidationInfo):
         if v == "":

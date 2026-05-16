@@ -231,6 +231,8 @@ class SSEBuilder:
         content_block: dict = {"type": block_type}
         if block_type == "thinking":
             content_block["thinking"] = kwargs.get("thinking", "")
+        elif block_type == "redacted_thinking":
+            content_block["data"] = kwargs.get("data", "")
         elif block_type == "text":
             content_block["text"] = kwargs.get("text", "")
         elif block_type == "tool_use":
@@ -288,6 +290,27 @@ class SSEBuilder:
     def stop_thinking_block(self) -> str:
         self.blocks.thinking_started = False
         return self.content_block_stop(self.blocks.thinking_index)
+
+    def emit_redacted_thinking_block(self, thinking_text: str) -> list[str]:
+        """Emit a complete ``redacted_thinking`` block (start + stop, no deltas).
+
+        Providers like NIM cannot produce valid Anthropic cryptographic thinking
+        signatures.  Emitting a ``redacted_thinking`` block (which carries opaque
+        ``data`` instead of a ``signature``) avoids signature validation failures
+        in downstream consumers like Claude Code while preserving conversation
+        history replay information.
+
+        The block is self-contained: start → stop, no intermediate deltas,
+        matching the Anthropic ``redacted_thinking`` streaming contract.
+        """
+        import base64
+
+        idx = self.blocks.allocate_index()
+        encoded = base64.b64encode(thinking_text.encode("utf-8")).decode("ascii")
+        return [
+            self.content_block_start(idx, "redacted_thinking", data=encoded),
+            self.content_block_stop(idx),
+        ]
 
     def start_text_block(self) -> str:
         self.blocks.text_index = self.blocks.allocate_index()

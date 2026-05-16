@@ -12,6 +12,33 @@ _CONTROL_TOKEN_RE = re.compile(r"<\|[^|>]{1,80}\|>")
 _CONTROL_TOKEN_START = "<|"
 _CONTROL_TOKEN_END = "|>"
 
+_XML_TOOL_CALL_RE = re.compile(
+    r"<(?P<name>[A-Z][A-Za-z0-9_]+)"
+    r"(?:\s[^>]*)?>"
+    r"(?P<params>.*?)"
+    r"</(?P=name)>",
+    re.DOTALL,
+)
+_XML_PARAM_RE = re.compile(
+    r"<(?P<key>[a-zA-Z_][a-zA-Z0-9_]*)>(?P<value>.*?)</(?P=key)>",
+    re.DOTALL,
+)
+_KNOWN_TOOL_NAMES = frozenset(
+    {
+        "Bash",
+        "Read",
+        "Write",
+        "Edit",
+        "Glob",
+        "Grep",
+        "Task",
+        "WebFetch",
+        "Question",
+        "Skill",
+        "BashTool",
+    }
+)
+
 
 class ParserState(Enum):
     TEXT = 1
@@ -24,7 +51,8 @@ class HeuristicToolParser:
     Stateful parser for raw text tool calls.
 
     Some OpenAI-compatible models emit tool calls as text rather than structured
-    chunks. This parser converts the common ``● <function=...>`` form into
+    chunks. This parser converts the common ``● <function=...>`` form and the
+    NIM XML-style ``<ToolName><param>value</param></ToolName>`` form into
     Anthropic-style ``tool_use`` blocks.
     """
 
@@ -42,6 +70,55 @@ class HeuristicToolParser:
         self._current_tool_id = None
         self._current_function_name = None
         self._current_parameters = {}
+
+    @staticmethod
+    def extract_xml_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
+        """Extract XML-style tool calls like ``<Read><filePath>/tmp/x</filePath></Read>``.
+
+        NIM models with ``thinking=True`` emit tool calls in this format inside
+        ``reasoning_content`` instead of structured ``tool_calls``.  This method
+        is stateless (works on complete text) and returns the remaining text
+        after removing matched tool calls plus a list of detected tool_use dicts.
+        """
+        detected: list[dict[str, Any]] = []
+        remaining = text
+
+        for match in _XML_TOOL_CALL_RE.finditer(text):
+            tool_name = match.group("name")
+            params_text = match.group("params")
+
+            if tool_name not in _KNOWN_TOOL_NAMES:
+                continue
+
+            params: dict[str, str] = {}
+            for param_match in _XML_PARAM_RE.finditer(params_text):
+                key = param_match.group("key")
+                value = param_match.group("value")
+                params[key] = value
+
+            if not params:
+                continue
+
+            detected.append(
+                {
+                    "type": "tool_use",
+                    "id": f"toolu_xml_{uuid.uuid4().hex[:8]}",
+                    "name": tool_name,
+                    "input": params,
+                }
+            )
+            logger.debug(
+                "Heuristic bypass: Detected XML-style tool call '{}' with {} params",
+                tool_name,
+                len(params),
+            )
+
+        if detected:
+            remaining = _XML_TOOL_CALL_RE.sub("", text).strip()
+            if not remaining:
+                remaining = ""
+
+        return remaining, detected
 
     def _extract_web_tool_json_calls(self) -> tuple[str, list[dict[str, Any]]]:
         detected_tools: list[dict[str, Any]] = []
@@ -112,7 +189,6 @@ class HeuristicToolParser:
                     if safe_prefix:
                         filtered_output_parts.append(safe_prefix)
                         break
-
                     filtered_output_parts.append(self._buffer)
                     self._buffer = ""
                     break
@@ -158,7 +234,7 @@ class HeuristicToolParser:
                     if idx > 0:
                         filtered_output_parts.append(self._buffer[:idx])
                         self._buffer = self._buffer[idx:]
-                    finished_tool_call = True
+                        finished_tool_call = True
                 elif len(self._buffer) > 0 and not self._buffer.strip().startswith("<"):
                     if "<parameter=" not in self._buffer:
                         filtered_output_parts.append(self._buffer)
@@ -188,7 +264,7 @@ class HeuristicToolParser:
     def flush(self) -> list[dict[str, Any]]:
         """Flush any remaining tool call in the buffer."""
         self._buffer = self._strip_control_tokens(self._buffer)
-        detected_tools = []
+        detected_tools: list[dict[str, Any]] = []
         if self._state == ParserState.PARSING_PARAMETERS:
             partial_matches = re.finditer(
                 r"<parameter=([^>]+)>(.*)$", self._buffer, re.DOTALL

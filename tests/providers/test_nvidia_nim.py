@@ -6,9 +6,18 @@ import pytest
 from httpx import Request, Response
 
 from config.nim import NimSettings
+from core.anthropic.sse import SSEBuilder
+from core.anthropic.stream_contracts import (
+    assert_anthropic_stream_contract,
+    parse_sse_text,
+)
 from providers.defaults import NVIDIA_NIM_DEFAULT_BASE
 from providers.nvidia_nim import NvidiaNimProvider
-from providers.nvidia_nim.request import NIM_TOOL_ARGUMENT_ALIASES_KEY
+from providers.nvidia_nim.client import _convert_nonstream_to_sse
+from providers.nvidia_nim.request import (
+    NIM_TOOL_ARGUMENT_ALIASES_KEY,
+    clone_body_without_all_thinking,
+)
 
 
 # Mock data classes
@@ -159,8 +168,6 @@ async def test_build_request_body(provider_config):
     assert "extra_body" in body
     ctk = body["extra_body"]["chat_template_kwargs"]
     assert ctk["thinking"] is True
-    assert ctk["enable_thinking"] is True
-    assert ctk["reasoning_budget"] == body["max_tokens"]
     assert "reasoning_budget" not in body["extra_body"]
 
 
@@ -283,7 +290,12 @@ async def test_stream_response_text(nim_provider):
 
 @pytest.mark.asyncio
 async def test_stream_response_thinking_reasoning_content(nim_provider):
-    """Test streaming with native reasoning_content."""
+    """Test streaming with native reasoning_content — NIM emits as text.
+
+    NIM models with ``thinking=True`` place the entire response in
+    ``reasoning_content`` (the ``content`` field is empty). The proxy
+    therefore treats ``reasoning_content`` as regular text output.
+    """
     req = MockRequest()
 
     mock_chunk = MagicMock()
@@ -305,16 +317,13 @@ async def test_stream_response_thinking_reasoning_content(nim_provider):
 
         events = [e async for e in nim_provider.stream_response(req)]
 
-        # Check for thinking_delta
-        found_thinking = False
+        found_text = False
         for e in events:
-            if (
-                "event: content_block_delta" in e
-                and '"thinking_delta"' in e
-                and "Thinking..." in e
-            ):
-                found_thinking = True
-        assert found_thinking
+            if "event: content_block_start" in e and '"text"' in e:
+                found_text = True
+        assert found_text
+        event_text = "".join(events)
+        assert "Thinking..." in event_text
 
 
 @pytest.mark.asyncio
@@ -328,9 +337,7 @@ async def test_stream_response_suppresses_thinking_when_disabled(provider_config
     mock_chunk = MagicMock()
     mock_chunk.choices = [
         MagicMock(
-            delta=MagicMock(
-                content="<think>secret</think>Answer", reasoning_content="Thinking..."
-            ),
+            delta=MagicMock(content="Answer", reasoning_content="Thinking..."),
             finish_reason="stop",
         )
     ]
@@ -346,11 +353,10 @@ async def test_stream_response_suppresses_thinking_when_disabled(provider_config
 
         events = [e async for e in provider.stream_response(req)]
 
-    event_text = "".join(events)
-    assert "thinking_delta" not in event_text
-    assert "Thinking..." not in event_text
-    assert "secret" not in event_text
-    assert "Answer" in event_text
+        event_text = "".join(events)
+        assert "thinking_delta" not in event_text
+        assert "Thinking..." in event_text
+        assert "Answer" in event_text
 
 
 def _make_bad_request_error(message: str) -> openai.BadRequestError:
@@ -398,16 +404,12 @@ async def test_stream_response_retries_without_chat_template(provider_config):
     assert first_extra["chat_template"] == "custom_template"
     assert first_extra["chat_template_kwargs"] == {
         "thinking": True,
-        "enable_thinking": True,
-        "reasoning_budget": 100,
     }
     assert "reasoning_budget" not in first_extra
 
     assert "chat_template" not in second_extra
     assert second_extra["chat_template_kwargs"] == {
         "thinking": True,
-        "enable_thinking": True,
-        "reasoning_budget": 100,
     }
     assert "reasoning_budget" not in second_extra
 
@@ -680,7 +682,7 @@ async def test_stream_response_retries_without_reasoning_budget(nim_provider):
     async def mock_stream():
         yield mock_chunk
 
-    error = _make_bad_request_error("Unsupported field: reasoning_budget")
+    error = _make_bad_request_error("Unsupported field: enable_thinking")
 
     with patch.object(
         nim_provider._client.chat.completions, "create", new_callable=AsyncMock
@@ -692,13 +694,9 @@ async def test_stream_response_retries_without_reasoning_budget(nim_provider):
     assert mock_create.await_count == 2
     first_call = mock_create.await_args_list[0].kwargs
     second_call = mock_create.await_args_list[1].kwargs
-    assert (
-        first_call["extra_body"]["chat_template_kwargs"]["reasoning_budget"]
-        == first_call["max_tokens"]
-    )
-    assert "reasoning_budget" not in second_call["extra_body"]
-    assert "reasoning_budget" not in second_call["extra_body"]["chat_template_kwargs"]
-    assert second_call["extra_body"]["chat_template_kwargs"]["enable_thinking"] is True
+    assert first_call["extra_body"]["chat_template_kwargs"]["thinking"] is True
+    # On retry, all thinking-related fields should be stripped
+    assert "chat_template_kwargs" not in second_call["extra_body"]
     assert any("Recovered" in event for event in events)
     assert any("message_stop" in event for event in events)
 
@@ -771,3 +769,944 @@ async def test_stream_response_bad_request_without_reasoning_budget_does_not_ret
     assert mock_create.await_count == 1
     assert any("Invalid request sent to provider" in event for event in events)
     assert any("message_stop" in event for event in events)
+
+
+@pytest.mark.asyncio
+async def test_stream_response_bad_request_with_thinking_hint_strips_all(
+    nim_provider,
+):
+    req = MockRequest()
+    error = _make_bad_request_error("Unknown field: chat_template_kwargs")
+
+    nonstream_response = _MockResponse(
+        choices=[_MockChoice(_MockMessage(content="ok"))],
+        usage=_MockUsage(10),
+    )
+
+    with patch.object(
+        nim_provider._client.chat.completions, "create", new_callable=AsyncMock
+    ) as mock_create:
+        mock_create.side_effect = [error, nonstream_response]
+
+        events = [e async for e in nim_provider.stream_response(req)]
+
+        assert mock_create.await_count == 2
+        assert any("event: content_block_start" in e for e in events)
+
+
+@pytest.mark.asyncio
+async def test_stream_response_bad_request_with_enable_thinking_hint_strips_all(
+    nim_provider,
+):
+    req = MockRequest()
+    error = _make_bad_request_error("Field enable_thinking is not supported")
+
+    nonstream_response = _MockResponse(
+        choices=[_MockChoice(_MockMessage(content="ok"))],
+        usage=_MockUsage(10),
+    )
+
+    with patch.object(
+        nim_provider._client.chat.completions, "create", new_callable=AsyncMock
+    ) as mock_create:
+        mock_create.side_effect = [error, nonstream_response]
+
+        async for _ in nim_provider.stream_response(req):
+            pass
+
+        assert mock_create.await_count == 2
+
+
+def test_clone_body_without_all_thinking_strips_all_thinking_fields():
+    body = {
+        "model": "moonshotai/kimi-k2.6",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 32000,
+        "extra_body": {
+            "chat_template_kwargs": {
+                "thinking": True,
+            },
+            "ignore_eos": False,
+            "top_k": 50,
+        },
+    }
+    result = clone_body_without_all_thinking(body)
+    assert result is not None
+    assert "chat_template_kwargs" not in result["extra_body"]
+    assert "ignore_eos" not in result["extra_body"]
+    assert result["extra_body"]["top_k"] == 50
+    assert result["model"] == "moonshotai/kimi-k2.6"
+
+
+def test_clone_body_without_all_thinking_returns_none_when_no_thinking_params():
+    body = {
+        "model": "moonshotai/kimi-k2.6",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 32000,
+        "extra_body": {"top_k": 50},
+    }
+    result = clone_body_without_all_thinking(body)
+    assert result is None
+
+
+def test_clone_body_without_all_thinking_removes_empty_extra_body():
+    body = {
+        "model": "moonshotai/kimi-k2.6",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 32000,
+        "extra_body": {"chat_template_kwargs": {"thinking": True}},
+    }
+    result = clone_body_without_all_thinking(body)
+    assert result is not None
+    assert "extra_body" not in result
+
+
+class _MockFunction:
+    def __init__(self, name: str, arguments: str):
+        self.name = name
+        self.arguments = arguments
+
+
+class _MockToolCall:
+    def __init__(self, id: str | None, function: _MockFunction):
+        self.id = id
+        self.function = function
+
+
+class _MockMessage:
+    def __init__(
+        self,
+        content: str | None = None,
+        tool_calls: list | None = None,
+        reasoning_content: str | None = None,
+    ):
+        self.content = content
+        self.tool_calls = tool_calls
+        self.reasoning_content = reasoning_content
+
+
+class _MockChoice:
+    def __init__(self, message: _MockMessage, finish_reason: str = "stop"):
+        self.message = message
+        self.finish_reason = finish_reason
+
+
+class _MockUsage:
+    def __init__(self, completion_tokens: int = 10):
+        self.completion_tokens = completion_tokens
+
+
+class _MockResponse:
+    def __init__(self, choices: list, usage: _MockUsage | None = None):
+        self.choices = choices
+        self.usage = usage
+
+
+def _parse_events(
+    raw_events: list[str], prefix_events: list[str] | None = None
+) -> list:
+    all_events = (prefix_events or []) + raw_events
+    raw_text = "".join(all_events)
+    return parse_sse_text(raw_text)
+
+
+def test_convert_nonstream_to_sse_text_only():
+    message = _MockMessage(content="Hello world")
+    response = _MockResponse([_MockChoice(message, "stop")], _MockUsage(5))
+    sse = SSEBuilder("msg_test", "test-model", 10)
+    prefix = [sse.message_start()]
+    events = _convert_nonstream_to_sse(response, sse, thinking_enabled=False)
+    parsed = _parse_events(events, prefix)
+    assert_anthropic_stream_contract(parsed)
+    assert any(
+        e.event == "content_block_start"
+        and e.data.get("content_block", {}).get("type") == "text"
+        for e in parsed
+    )
+    text_parts = [
+        e.data["delta"]["text"]
+        for e in parsed
+        if e.event == "content_block_delta"
+        and e.data.get("delta", {}).get("type") == "text_delta"
+    ]
+    assert "Hello world" in "".join(text_parts)
+
+
+def test_convert_nonstream_to_sse_tool_calls():
+    tc = _MockToolCall("call_abc", _MockFunction("read_file", '{"path": "/tmp/x"}'))
+    message = _MockMessage(content=None, tool_calls=[tc])
+    response = _MockResponse([_MockChoice(message, "tool_calls")], _MockUsage(20))
+    sse = SSEBuilder("msg_test", "test-model", 10)
+    prefix = [sse.message_start()]
+    events = _convert_nonstream_to_sse(response, sse, thinking_enabled=False)
+    parsed = _parse_events(events, prefix)
+    assert_anthropic_stream_contract(parsed)
+    tool_starts = [
+        e
+        for e in parsed
+        if e.event == "content_block_start"
+        and e.data.get("content_block", {}).get("type") == "tool_use"
+    ]
+    assert len(tool_starts) == 1
+    assert tool_starts[0].data["content_block"]["name"] == "read_file"
+    assert tool_starts[0].data["content_block"]["id"] == "call_abc"
+    json_deltas = [
+        e
+        for e in parsed
+        if e.event == "content_block_delta"
+        and e.data.get("delta", {}).get("type") == "input_json_delta"
+    ]
+    args_text = "".join(e.data["delta"]["partial_json"] for e in json_deltas)
+    assert json.loads(args_text) == {"path": "/tmp/x"}
+
+
+def test_convert_nonstream_to_sse_multiple_tool_calls():
+    tc1 = _MockToolCall("call_1", _MockFunction("bash", '{"command": "ls"}'))
+    tc2 = _MockToolCall("call_2", _MockFunction("read_file", '{"path": "/a"}'))
+    message = _MockMessage(content=None, tool_calls=[tc1, tc2])
+    response = _MockResponse([_MockChoice(message, "tool_calls")], _MockUsage(30))
+    sse = SSEBuilder("msg_test", "test-model", 10)
+    prefix = [sse.message_start()]
+    events = _convert_nonstream_to_sse(response, sse, thinking_enabled=False)
+    parsed = _parse_events(events, prefix)
+    assert_anthropic_stream_contract(parsed)
+    tool_starts = [
+        e
+        for e in parsed
+        if e.event == "content_block_start"
+        and e.data.get("content_block", {}).get("type") == "tool_use"
+    ]
+    assert len(tool_starts) == 2
+    assert tool_starts[0].data["content_block"]["name"] == "bash"
+    assert tool_starts[1].data["content_block"]["name"] == "read_file"
+
+
+def test_convert_nonstream_to_sse_text_then_tool_calls():
+    tc = _MockToolCall("call_1", _MockFunction("search", '{"q": "test"}'))
+    message = _MockMessage(content="Let me search for that.", tool_calls=[tc])
+    response = _MockResponse([_MockChoice(message, "tool_calls")], _MockUsage(25))
+    sse = SSEBuilder("msg_test", "test-model", 10)
+    prefix = [sse.message_start()]
+    events = _convert_nonstream_to_sse(response, sse, thinking_enabled=False)
+    parsed = _parse_events(events, prefix)
+    assert_anthropic_stream_contract(parsed)
+    block_starts = [e for e in parsed if e.event == "content_block_start"]
+    types = [e.data["content_block"]["type"] for e in block_starts]
+    assert "text" in types
+    assert "tool_use" in types
+
+
+def test_convert_nonstream_to_sse_reasoning_content():
+    message = _MockMessage(content="Answer", reasoning_content="Deep thoughts")
+    response = _MockResponse([_MockChoice(message, "stop")], _MockUsage(15))
+    sse = SSEBuilder("msg_test", "test-model", 10)
+    prefix = [sse.message_start()]
+    events = _convert_nonstream_to_sse(response, sse, thinking_enabled=True)
+    parsed = _parse_events(events, prefix)
+    assert_anthropic_stream_contract(parsed)
+    text_starts = [
+        e
+        for e in parsed
+        if e.event == "content_block_start"
+        and e.data.get("content_block", {}).get("type") == "text"
+    ]
+    assert len(text_starts) >= 1
+    event_text = "".join(e.raw for e in parsed)
+    assert "Deep thoughts" in event_text
+    assert "Answer" in event_text
+
+
+def test_convert_nonstream_to_sse_reasoning_suppressed_when_disabled():
+    message = _MockMessage(content="Answer", reasoning_content="secret reasoning")
+    response = _MockResponse([_MockChoice(message, "stop")], _MockUsage(15))
+    sse = SSEBuilder("msg_test", "test-model", 10)
+    prefix = [sse.message_start()]
+    events = _convert_nonstream_to_sse(response, sse, thinking_enabled=False)
+    parsed = _parse_events(events, prefix)
+    assert_anthropic_stream_contract(parsed)
+    event_text = "".join(e.raw for e in parsed)
+    assert "thinking_delta" not in event_text
+    assert "secret reasoning" in event_text
+    assert "Answer" in event_text
+
+
+def test_convert_nonstream_to_sse_empty_content_with_tool():
+    tc = _MockToolCall("call_1", _MockFunction("run", '{"cmd": "true"}'))
+    message = _MockMessage(content=None, tool_calls=[tc])
+    response = _MockResponse([_MockChoice(message, "tool_calls")], _MockUsage(8))
+    sse = SSEBuilder("msg_test", "test-model", 10)
+    prefix = [sse.message_start()]
+    events = _convert_nonstream_to_sse(response, sse, thinking_enabled=False)
+    parsed = _parse_events(events, prefix)
+    assert_anthropic_stream_contract(parsed)
+
+
+def test_convert_nonstream_to_sse_tool_call_without_id_gets_uuid():
+    tc = _MockToolCall(id=None, function=_MockFunction("my_tool", '{"x": 1}'))
+    message = _MockMessage(content=None, tool_calls=[tc])
+    response = _MockResponse([_MockChoice(message, "tool_calls")], _MockUsage(5))
+    sse = SSEBuilder("msg_test", "test-model", 10)
+    prefix = [sse.message_start()]
+    events = _convert_nonstream_to_sse(response, sse, thinking_enabled=False)
+    parsed = _parse_events(events, prefix)
+    tool_starts = [
+        e
+        for e in parsed
+        if e.event == "content_block_start"
+        and e.data.get("content_block", {}).get("type") == "tool_use"
+    ]
+    assert len(tool_starts) == 1
+    assert tool_starts[0].data["content_block"]["id"].startswith("tool_")
+
+
+def test_convert_nonstream_to_sse_estimates_tokens_when_no_usage():
+    message = _MockMessage(content="Short reply")
+    response = _MockResponse([_MockChoice(message, "stop")], usage=None)
+    sse = SSEBuilder("msg_test", "test-model", 10)
+    prefix = [sse.message_start()]
+    events = _convert_nonstream_to_sse(response, sse, thinking_enabled=False)
+    parsed = _parse_events(events, prefix)
+    assert_anthropic_stream_contract(parsed)
+    deltas = [e for e in parsed if e.event == "message_delta"]
+    assert len(deltas) >= 1
+    assert deltas[-1].data["usage"]["output_tokens"] > 0
+
+
+def test_convert_nonstream_to_sse_stop_reason_mapping():
+    message = _MockMessage(content="Hi")
+    response = _MockResponse([_MockChoice(message, "length")], _MockUsage(3))
+    sse = SSEBuilder("msg_test", "test-model", 10)
+    prefix = [sse.message_start()]
+    events = _convert_nonstream_to_sse(response, sse, thinking_enabled=False)
+    parsed = _parse_events(events, prefix)
+    deltas = [e for e in parsed if e.event == "message_delta"]
+    assert deltas[-1].data["delta"]["stop_reason"] == "max_tokens"
+
+
+def test_convert_nonstream_to_sse_tool_calls_stop_reason():
+    tc = _MockToolCall("call_1", _MockFunction("fn", "{}"))
+    message = _MockMessage(content=None, tool_calls=[tc])
+    response = _MockResponse([_MockChoice(message, "tool_calls")], _MockUsage(5))
+    sse = SSEBuilder("msg_test", "test-model", 10)
+    prefix = [sse.message_start()]
+    events = _convert_nonstream_to_sse(response, sse, thinking_enabled=False)
+    parsed = _parse_events(events, prefix)
+    deltas = [e for e in parsed if e.event == "message_delta"]
+    assert deltas[-1].data["delta"]["stop_reason"] == "tool_use"
+
+
+@pytest.mark.asyncio
+async def test_stream_response_uses_streaming_when_tools_and_reasoning_content_is_text(
+    nim_provider,
+):
+    req = MockRequest()
+    req.tools = [MockTool("bash", "Run commands", {"type": "object"})]
+
+    mock_chunk = MagicMock()
+    mock_chunk.choices = [
+        MagicMock(
+            delta=MagicMock(
+                content=None,
+                tool_calls=[
+                    MagicMock(
+                        id="call_1",
+                        index=0,
+                        function=MagicMock(name="bash", arguments='{"command": "ls"}'),
+                    )
+                ],
+            ),
+            finish_reason="tool_calls",
+        )
+    ]
+    mock_chunk.usage = MagicMock(completion_tokens=5)
+
+    async def mock_stream():
+        yield mock_chunk
+
+    async def _passthrough(fn, *args, **kwargs):
+        return await fn(*args, **kwargs)
+
+    with (
+        patch.object(
+            nim_provider._client.chat.completions, "create", new_callable=AsyncMock
+        ) as mock_create,
+        patch.object(
+            nim_provider._global_rate_limiter,
+            "execute_with_retry",
+            new_callable=AsyncMock,
+            side_effect=_passthrough,
+        ),
+    ):
+        mock_create.return_value = mock_stream()
+        [_ async for _ in nim_provider.stream_response(req)]
+        mock_create.assert_awaited_once()
+        call_kwargs = mock_create.call_args
+        assert call_kwargs.kwargs.get("stream") is True
+
+
+@pytest.mark.asyncio
+async def test_stream_response_uses_nonstream_when_tools_and_reasoning_content_is_not_text(
+    nim_provider,
+):
+    nim_provider._reasoning_content_is_text = False
+    req = MockRequest()
+    req.tools = [MockTool("bash", "Run commands", {"type": "object"})]
+
+    tc = _MockToolCall("call_1", _MockFunction("bash", '{"command": "ls"}'))
+    mock_message = _MockMessage(content=None, tool_calls=[tc])
+    mock_response = _MockResponse(
+        [_MockChoice(mock_message, "tool_calls")], _MockUsage(10)
+    )
+
+    with patch.object(
+        nim_provider._client.chat.completions, "create", new_callable=AsyncMock
+    ) as mock_create:
+        mock_create.return_value = mock_response
+        [_ async for _ in nim_provider.stream_response(req)]
+        mock_create.assert_awaited_once()
+        call_kwargs = mock_create.call_args
+        assert call_kwargs.kwargs.get("stream") is False
+
+
+@pytest.mark.asyncio
+async def test_stream_response_uses_streaming_when_no_tools(nim_provider):
+    req = MockRequest()
+
+    mock_chunk = MagicMock()
+    mock_chunk.choices = [
+        MagicMock(
+            delta=MagicMock(content="Hello", reasoning_content=""), finish_reason="stop"
+        )
+    ]
+    mock_chunk.usage = MagicMock(completion_tokens=5)
+
+    async def mock_stream():
+        yield mock_chunk
+
+    async def _passthrough(fn, *args, **kwargs):
+        return await fn(*args, **kwargs)
+
+    with (
+        patch.object(
+            nim_provider._client.chat.completions, "create", new_callable=AsyncMock
+        ) as mock_create,
+        patch.object(
+            nim_provider._global_rate_limiter,
+            "execute_with_retry",
+            new_callable=AsyncMock,
+            side_effect=_passthrough,
+        ),
+    ):
+        mock_create.return_value = mock_stream()
+        [_ async for _ in nim_provider.stream_response(req)]
+        call_kwargs = mock_create.call_args
+        assert call_kwargs.kwargs.get("stream") is True
+
+
+@pytest.mark.asyncio
+async def test_nonstream_tools_emits_error_on_rate_limit_exhausted(nim_provider):
+    req = MockRequest()
+    req.tools = [MockTool("bash", "Run commands", {"type": "object"})]
+
+    rate_limit_error = openai.RateLimitError(
+        "Too Many Requests",
+        response=Response(
+            status_code=429,
+            request=Request("POST", f"{NVIDIA_NIM_DEFAULT_BASE}/chat/completions"),
+        ),
+        body={"error": {"message": "Too Many Requests", "type": "RateLimitError"}},
+    )
+
+    with (
+        patch.object(
+            nim_provider._client.chat.completions,
+            "create",
+            new_callable=AsyncMock,
+        ),
+        patch.object(
+            nim_provider._global_rate_limiter,
+            "execute_with_retry",
+            new_callable=AsyncMock,
+            side_effect=rate_limit_error,
+        ),
+    ):
+        events = [e async for e in nim_provider.stream_response(req)]
+
+        event_text = "".join(events)
+        assert "event: message_stop" in event_text
+        assert "rate" in event_text.lower() or "too many" in event_text.lower()
+
+
+@pytest.mark.asyncio
+async def test_nonstream_tools_emits_error_when_both_paths_fail(nim_provider):
+    req = MockRequest()
+    req.tools = [MockTool("bash", "Run commands", {"type": "object"})]
+
+    rate_limit_error = openai.RateLimitError(
+        "Too Many Requests",
+        response=Response(
+            status_code=429,
+            request=Request("POST", f"{NVIDIA_NIM_DEFAULT_BASE}/chat/completions"),
+        ),
+        body={"error": {"message": "Too Many Requests", "type": "RateLimitError"}},
+    )
+
+    with (
+        patch.object(
+            nim_provider._client.chat.completions,
+            "create",
+            new_callable=AsyncMock,
+        ),
+        patch.object(
+            nim_provider._global_rate_limiter,
+            "execute_with_retry",
+            new_callable=AsyncMock,
+            side_effect=rate_limit_error,
+        ),
+    ):
+        events = [e async for e in nim_provider.stream_response(req)]
+
+        event_text = "".join(events)
+        assert "event: message_stop" in event_text
+        assert "rate" in event_text.lower() or "too many" in event_text.lower()
+
+
+@pytest.mark.asyncio
+async def test_nonstream_tools_emits_error_on_timeout_both_fail(nim_provider):
+    req = MockRequest()
+    req.tools = [MockTool("bash", "Run commands", {"type": "object"})]
+
+    timeout_error = openai.APITimeoutError(request=Request("POST", "http://test"))
+
+    with (
+        patch.object(
+            nim_provider._client.chat.completions,
+            "create",
+            new_callable=AsyncMock,
+        ),
+        patch.object(
+            nim_provider._global_rate_limiter,
+            "execute_with_retry",
+            new_callable=AsyncMock,
+            side_effect=timeout_error,
+        ),
+    ):
+        events = [e async for e in nim_provider.stream_response(req)]
+
+        event_text = "".join(events)
+        assert "event: message_stop" in event_text
+        assert "provider api request failed" in event_text.lower()
+
+
+@pytest.mark.asyncio
+async def test_nonstream_tools_streaming_fallback_fixes_broken_tool_calls(
+    nim_provider,
+):
+    nim_provider._reasoning_content_is_text = False
+    req = MockRequest()
+    req.tools = [MockTool("bash", "Run commands", {"type": "object"})]
+
+    bad_request_error = openai.BadRequestError(
+        "Bad Request",
+        response=Response(
+            status_code=400,
+            request=Request("POST", f"{NVIDIA_NIM_DEFAULT_BASE}/chat/completions"),
+        ),
+        body={"error": {"message": "Unknown parameter: something"}},
+    )
+
+    mock_tc_first = MagicMock()
+    mock_tc_first.index = 0
+    mock_tc_first.id = "call_abc"
+    mock_tc_first.type = "function"
+    mock_tc_first.function = MagicMock()
+    mock_tc_first.function.name = "bash"
+    mock_tc_first.function.arguments = '{"comma'
+
+    mock_tc_continuation = MagicMock()
+    mock_tc_continuation.index = 0
+    mock_tc_continuation.id = None
+    mock_tc_continuation.type = None
+    mock_tc_continuation.function = MagicMock()
+    mock_tc_continuation.function.name = None
+    mock_tc_continuation.function.arguments = 'nd": "ls"}'
+
+    mock_chunk1 = MagicMock()
+    mock_chunk1.choices = [
+        MagicMock(
+            delta=MagicMock(
+                content=None, reasoning_content="", tool_calls=[mock_tc_first]
+            ),
+            finish_reason=None,
+        )
+    ]
+    mock_chunk1.usage = None
+
+    mock_chunk2 = MagicMock()
+    mock_chunk2.choices = [
+        MagicMock(
+            delta=MagicMock(
+                content=None, reasoning_content="", tool_calls=[mock_tc_continuation]
+            ),
+            finish_reason="tool_calls",
+        )
+    ]
+    mock_chunk2.usage = MagicMock(completion_tokens=10)
+
+    async def mock_stream():
+        yield mock_chunk1
+        yield mock_chunk2
+
+    call_count = 0
+
+    async def _execute_with_retry(fn, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise bad_request_error
+        return await fn(*args, **kwargs)
+
+    with (
+        patch.object(
+            nim_provider._client.chat.completions, "create", new_callable=AsyncMock
+        ) as mock_create,
+        patch.object(
+            nim_provider._global_rate_limiter,
+            "execute_with_retry",
+            new_callable=AsyncMock,
+            side_effect=_execute_with_retry,
+        ),
+    ):
+        mock_create.return_value = mock_stream()
+        events = [e async for e in nim_provider.stream_response(req)]
+
+        assert mock_create.await_count >= 1
+        last_call = mock_create.call_args_list[-1]
+        assert last_call.kwargs.get("stream") is True
+
+    event_text = "".join(events)
+    assert "event: message_stop" in event_text
+
+
+@pytest.mark.asyncio
+async def test_context_overflow_reduces_reasoning_budget(nim_provider):
+    req = MockRequest()
+    req.max_tokens = 32000
+    req.tools = [MockTool("bash", "Run commands", {"type": "object"})]
+
+    context_overflow_error = openai.BadRequestError(
+        "You passed 170753 input tokens and requested 32000 output tokens. "
+        "However, the model's context length is only 202752 tokens, "
+        "resulting in a maximum input length of 170752 tokens. "
+        "Please reduce the length of the input prompt. "
+        "(parameter=input_tokens, value=170753)",
+        response=Response(
+            status_code=400,
+            request=Request("POST", f"{NVIDIA_NIM_DEFAULT_BASE}/chat/completions"),
+        ),
+        body={
+            "error": {
+                "message": "You passed 170753 input tokens and requested 32000 output tokens. "
+                "However, the model's context length is only 202752 tokens",
+                "type": "BadRequestError",
+                "param": "input_tokens",
+                "code": 400,
+            }
+        },
+    )
+
+    mock_response = MagicMock()
+    mock_response.choices = [
+        MagicMock(
+            message=MagicMock(
+                content="ok",
+                tool_calls=[],
+                reasoning_content=None,
+            ),
+            finish_reason="stop",
+        )
+    ]
+    mock_response.usage = MagicMock(completion_tokens=5)
+
+    async def _execute_with_retry(fn, *args, **kwargs):
+        return mock_response
+
+    with (
+        patch.object(
+            nim_provider._client.chat.completions,
+            "create",
+            new_callable=AsyncMock,
+            side_effect=[context_overflow_error, mock_response],
+        ),
+        patch.object(
+            nim_provider._global_rate_limiter,
+            "execute_with_retry",
+            new_callable=AsyncMock,
+            side_effect=_execute_with_retry,
+        ),
+    ):
+        events = [e async for e in nim_provider.stream_response(req)]
+
+        event_text = "".join(events)
+        assert "event: message_stop" in event_text
+
+
+@pytest.mark.asyncio
+async def test_context_overflow_second_retry_strips_all_thinking(nim_provider):
+    nim_provider._reasoning_content_is_text = False
+    req = MockRequest()
+    req.max_tokens = 32000
+    req.tools = [MockTool("bash", "Run commands", {"type": "object"})]
+
+    context_overflow_error = openai.BadRequestError(
+        "You passed 170753 input tokens and requested 32000 output tokens. "
+        "However, the model's context length is only 202752 tokens, "
+        "resulting in a maximum input length of 170752 tokens. "
+        "Please reduce the length of the input prompt. "
+        "(parameter=input_tokens, value=170753)",
+        response=Response(
+            status_code=400,
+            request=Request("POST", f"{NVIDIA_NIM_DEFAULT_BASE}/chat/completions"),
+        ),
+        body={
+            "error": {
+                "message": "You passed 170753 input tokens and requested 32000 output tokens. "
+                "However, the model's context length is only 202752 tokens",
+                "type": "BadRequestError",
+                "param": "input_tokens",
+                "code": 400,
+            }
+        },
+    )
+
+    second_context_overflow = openai.BadRequestError(
+        "You passed 170753 input tokens and requested 31935 output tokens. "
+        "However, the model's context length is only 202752 tokens. "
+        "(parameter=input_tokens, value=170753)",
+        response=Response(
+            status_code=400,
+            request=Request("POST", f"{NVIDIA_NIM_DEFAULT_BASE}/chat/completions"),
+        ),
+        body={
+            "error": {
+                "message": "You passed 170753 input tokens and requested 31935 output tokens.",
+                "type": "BadRequestError",
+                "param": "input_tokens",
+                "code": 400,
+            }
+        },
+    )
+
+    mock_response = MagicMock()
+    mock_response.choices = [
+        MagicMock(
+            message=MagicMock(
+                content="ok after strip",
+                tool_calls=[],
+                reasoning_content=None,
+            ),
+            finish_reason="stop",
+        )
+    ]
+    mock_response.usage = MagicMock(completion_tokens=5)
+
+    call_count = 0
+
+    async def _execute_with_retry(fn, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return await fn(*args, **kwargs)
+
+    with (
+        patch.object(
+            nim_provider._client.chat.completions,
+            "create",
+            new_callable=AsyncMock,
+            side_effect=[
+                context_overflow_error,
+                second_context_overflow,
+                mock_response,
+            ],
+        ),
+        patch.object(
+            nim_provider._global_rate_limiter,
+            "execute_with_retry",
+            new_callable=AsyncMock,
+            side_effect=_execute_with_retry,
+        ),
+    ):
+        events = [e async for e in nim_provider.stream_response(req)]
+
+    event_text = "".join(events)
+    assert "event: message_stop" in event_text
+    assert call_count == 3
+
+
+class TestRoundRobin:
+    """Tests for round-robin load balancing across API keys."""
+
+    def test_next_client_cycles_through_keys(self, provider_config):
+        """_next_client() returns clients in round-robin order."""
+        provider = NvidiaNimProvider(
+            provider_config,
+            nim_settings=NimSettings(),
+            fallback_api_keys=["key_b", "key_c"],
+        )
+        all_clients = [provider._client, *provider._fallback_clients]
+        assert len(all_clients) == 3
+
+        results = [provider._next_client() for _ in range(6)]
+        indices = [idx for _, idx in results]
+        clients = [c for c, _ in results]
+
+        assert indices == [0, 1, 2, 0, 1, 2]
+        assert clients == [
+            all_clients[0],
+            all_clients[1],
+            all_clients[2],
+            all_clients[0],
+            all_clients[1],
+            all_clients[2],
+        ]
+
+    def test_next_client_single_key(self, provider_config):
+        """_next_client() works with only the primary key (no fallbacks)."""
+        provider = NvidiaNimProvider(provider_config, nim_settings=NimSettings())
+        client, idx = provider._next_client()
+        assert idx == 0
+        assert client is provider._client
+
+        client2, idx2 = provider._next_client()
+        assert idx2 == 0
+        assert client2 is provider._client
+
+    @pytest.mark.asyncio
+    async def test_streaming_round_robin_distributes_requests(self, provider_config):
+        """Streaming path distributes requests across keys via round-robin."""
+        provider = NvidiaNimProvider(
+            provider_config,
+            nim_settings=NimSettings(),
+            fallback_api_keys=["key_b", "key_c"],
+        )
+        all_clients = [provider._client, *provider._fallback_clients]
+        call_counts: dict[int, int] = {0: 0, 1: 0, 2: 0}
+
+        async def make_streaming_request():
+            req = MockRequest()
+            mock_chunk = MagicMock()
+            mock_chunk.choices = [
+                MagicMock(
+                    delta=MagicMock(content="ok", reasoning_content=""),
+                    finish_reason="stop",
+                )
+            ]
+            mock_chunk.usage = MagicMock(completion_tokens=2)
+
+            async def mock_stream():
+                yield mock_chunk
+
+            async def _passthrough(fn, *args, **kwargs):
+                return await fn(*args, **kwargs)
+
+            with (
+                patch.object(
+                    provider._global_rate_limiter,
+                    "execute_with_retry",
+                    new_callable=AsyncMock,
+                    side_effect=_passthrough,
+                ),
+            ):
+                for c_idx, c in enumerate(all_clients):
+                    if call_counts[c_idx] == 0:
+                        with patch.object(
+                            c.chat.completions, "create", new_callable=AsyncMock
+                        ) as mock_create:
+                            mock_create.return_value = mock_stream()
+                            [_ async for _ in provider.stream_response(req)]
+                            call_counts[c_idx] += 1
+                        break
+
+        for _ in range(3):
+            await make_streaming_request()
+
+        assert sum(call_counts.values()) == 3
+
+    @pytest.mark.asyncio
+    async def test_nonstream_round_robin_starts_with_rotated_key(self, provider_config):
+        """Non-streaming (tools) path uses round-robin to pick starting key."""
+        provider = NvidiaNimProvider(
+            provider_config,
+            nim_settings=NimSettings(),
+            fallback_api_keys=["key_b", "key_c"],
+        )
+
+        _, first_idx = provider._next_client()
+        assert first_idx == 0
+
+        _, second_idx = provider._next_client()
+        assert second_idx == 1
+
+    @pytest.mark.asyncio
+    async def test_round_robin_failover_still_works_streaming(self, provider_config):
+        """Round-robin + failover: if the chosen key 429s, next key in rotation is tried."""
+        provider = NvidiaNimProvider(
+            provider_config,
+            nim_settings=NimSettings(),
+            fallback_api_keys=["key_b", "key_c"],
+        )
+
+        req = MockRequest()
+
+        rate_limit_error = openai.RateLimitError(
+            "Too Many Requests",
+            response=Response(
+                status_code=429,
+                request=Request("POST", f"{NVIDIA_NIM_DEFAULT_BASE}/chat/completions"),
+            ),
+            body={"error": {"message": "Too Many Requests"}},
+        )
+
+        mock_chunk = MagicMock()
+        mock_chunk.choices = [
+            MagicMock(
+                delta=MagicMock(content="recovered", reasoning_content=""),
+                finish_reason="stop",
+            )
+        ]
+        mock_chunk.usage = MagicMock(completion_tokens=2)
+
+        async def mock_stream():
+            yield mock_chunk
+
+        call_count = 0
+
+        async def _execute_with_retry(fn, *args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise rate_limit_error
+            return await fn(*args, **kwargs)
+
+        with (
+            patch.object(
+                provider._global_rate_limiter,
+                "execute_with_retry",
+                new_callable=AsyncMock,
+                side_effect=_execute_with_retry,
+            ),
+            patch.object(
+                provider._client.chat.completions,
+                "create",
+                new_callable=AsyncMock,
+                side_effect=rate_limit_error,
+            ),
+            patch.object(
+                provider._fallback_clients[0].chat.completions,
+                "create",
+                new_callable=AsyncMock,
+                return_value=mock_stream(),
+            ),
+        ):
+            events = [e async for e in provider.stream_response(req)]
+            event_text = "".join(events)
+            assert "recovered" in event_text or "event: message_stop" in event_text

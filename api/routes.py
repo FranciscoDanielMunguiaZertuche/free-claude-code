@@ -66,8 +66,13 @@ def get_proxy_service(
     """Build the request service for route handlers."""
     return ClaudeProxyService(
         settings,
-        provider_getter=lambda provider_type: dependencies.resolve_provider(
-            provider_type, app=request.app, settings=settings
+        provider_getter=lambda provider_type, *, claude_model=None: (
+            dependencies.resolve_provider(
+                provider_type,
+                app=request.app,
+                settings=settings,
+                claude_model=claude_model,
+            )
         ),
         token_counter=get_token_count,
     )

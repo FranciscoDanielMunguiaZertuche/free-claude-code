@@ -60,6 +60,8 @@ def _iter_heuristic_tool_use_sse(
 class OpenAIChatTransport(BaseProvider):
     """Base for OpenAI-compatible ``/chat/completions`` adapters (NIM, …)."""
 
+    _reasoning_content_is_text: bool = False
+
     def __init__(
         self,
         config: ProviderConfig,
@@ -397,10 +399,24 @@ class OpenAIChatTransport(BaseProvider):
 
                     # Handle reasoning_content (OpenAI extended format)
                     reasoning = getattr(delta, "reasoning_content", None)
-                    if thinking_enabled and reasoning:
-                        for event in sse.ensure_thinking_block():
-                            yield event
-                        yield sse.emit_thinking_delta(reasoning)
+                    if reasoning:
+                        if self._reasoning_content_is_text:
+                            filtered_text, detected_tools = heuristic_parser.feed(
+                                reasoning
+                            )
+                            if filtered_text:
+                                for event in sse.ensure_text_block():
+                                    yield event
+                                yield sse.emit_text_delta(filtered_text)
+                            for tool_use in detected_tools:
+                                for event in _iter_heuristic_tool_use_sse(
+                                    sse, tool_use
+                                ):
+                                    yield event
+                        elif thinking_enabled:
+                            for event in sse.ensure_thinking_block():
+                                yield event
+                            yield sse.emit_thinking_delta(reasoning)
 
                     # Provider-specific extra reasoning (e.g. OpenRouter reasoning_details)
                     for event in self._handle_extra_reasoning(
@@ -416,9 +432,14 @@ class OpenAIChatTransport(BaseProvider):
                             if part.type == ContentType.THINKING:
                                 if not thinking_enabled:
                                     continue
-                                for event in sse.ensure_thinking_block():
-                                    yield event
-                                yield sse.emit_thinking_delta(part.content)
+                                if self._reasoning_content_is_text:
+                                    for event in sse.ensure_text_block():
+                                        yield event
+                                    yield sse.emit_text_delta(part.content)
+                                else:
+                                    for event in sse.ensure_thinking_block():
+                                        yield event
+                                    yield sse.emit_thinking_delta(part.content)
                             else:
                                 filtered_text, detected_tools = heuristic_parser.feed(
                                     part.content
@@ -435,6 +456,8 @@ class OpenAIChatTransport(BaseProvider):
                                     ):
                                         yield event
 
+                    # Handle native tool calls
+                    # Handle native tool calls
                     # Handle native tool calls
                     if delta.tool_calls:
                         for event in sse.close_content_blocks():
@@ -455,7 +478,6 @@ class OpenAIChatTransport(BaseProvider):
                                 tool_argument_alias_buffers=tool_argument_alias_buffers,
                             ):
                                 yield event
-
             except asyncio.CancelledError, GeneratorExit:
                 raise
             except Exception as e:

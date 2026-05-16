@@ -13,10 +13,9 @@ from core.anthropic.native_messages_request import dump_raw_messages_request
 from providers.exceptions import InvalidRequestError
 
 # Block types not supported on DeepSeek partial Anthropic-compatible API.
+# Note: image and document are NOT unsupported when using MiMo endpoint.
 _UNSUPPORTED_MESSAGE_BLOCK_TYPES = frozenset(
     {
-        "image",
-        "document",
         "server_tool_use",
         "web_search_tool_result",
         "web_fetch_tool_result",

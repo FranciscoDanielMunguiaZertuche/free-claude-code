@@ -18,6 +18,8 @@ from providers.opencode import OpenCodeProvider
 from providers.registry import (
     PROVIDER_DESCRIPTORS,
     ProviderRegistry,
+    _nvidia_nim_api_key_for_model,
+    _nvidia_nim_cache_key,
     build_provider_config,
     create_provider,
 )
@@ -30,6 +32,8 @@ def _make_settings(**overrides):
     mock.model = "nvidia_nim/meta/llama3"
     mock.provider_type = "nvidia_nim"
     mock.nvidia_nim_api_key = "test_key"
+    mock.nvidia_nim_api_key_sonnet = ""
+    mock.nvidia_nim_api_key_opus = ""
     mock.open_router_api_key = "test_openrouter_key"
     mock.deepseek_api_key = "test_deepseek_key"
     mock.wafer_api_key = "test_wafer_key"
@@ -183,3 +187,115 @@ async def test_provider_registry_cleanup_exceptiongroup_on_multiple_failures() -
         await reg.cleanup()
     assert len(exc_info.value.exceptions) == 2
     assert reg._providers == {}
+
+
+def test_nvidia_nim_api_key_for_model_falls_back_to_base():
+    settings = _make_settings()
+    assert _nvidia_nim_api_key_for_model(settings, "claude-sonnet-4") == "test_key"
+    assert _nvidia_nim_api_key_for_model(settings, "claude-opus-4") == "test_key"
+
+
+def test_nvidia_nim_api_key_for_model_selects_sonnet_key():
+    settings = _make_settings(nvidia_nim_api_key_sonnet="sonnet_key_123")
+    assert (
+        _nvidia_nim_api_key_for_model(settings, "claude-sonnet-4-20250514")
+        == "sonnet_key_123"
+    )
+    assert _nvidia_nim_api_key_for_model(settings, "claude-opus-4") == "test_key"
+
+
+def test_nvidia_nim_api_key_for_model_selects_opus_key():
+    settings = _make_settings(nvidia_nim_api_key_opus="opus_key_456")
+    assert (
+        _nvidia_nim_api_key_for_model(settings, "claude-opus-4-20250514")
+        == "opus_key_456"
+    )
+    assert _nvidia_nim_api_key_for_model(settings, "claude-sonnet-4") == "test_key"
+
+
+def test_nvidia_nim_api_key_for_model_both_tiers():
+    settings = _make_settings(
+        nvidia_nim_api_key_sonnet="sonnet_key", nvidia_nim_api_key_opus="opus_key"
+    )
+    assert _nvidia_nim_api_key_for_model(settings, "claude-sonnet-4") == "sonnet_key"
+    assert _nvidia_nim_api_key_for_model(settings, "claude-opus-4") == "opus_key"
+
+
+def test_nvidia_nim_cache_key_base_when_no_tier_keys():
+    settings = _make_settings()
+    assert (
+        _nvidia_nim_cache_key("nvidia_nim", "claude-sonnet-4", settings) == "nvidia_nim"
+    )
+
+
+def test_nvidia_nim_cache_key_compound_for_sonnet():
+    settings = _make_settings(nvidia_nim_api_key_sonnet="sonnet_key")
+    assert (
+        _nvidia_nim_cache_key("nvidia_nim", "claude-sonnet-4", settings)
+        == "nvidia_nim:sonnet"
+    )
+
+
+def test_nvidia_nim_cache_key_compound_for_opus():
+    settings = _make_settings(nvidia_nim_api_key_opus="opus_key")
+    assert (
+        _nvidia_nim_cache_key("nvidia_nim", "claude-opus-4", settings)
+        == "nvidia_nim:opus"
+    )
+
+
+def test_provider_registry_dual_key_creates_separate_instances():
+    registry = ProviderRegistry()
+    settings = _make_settings(
+        nvidia_nim_api_key_sonnet="sonnet_key", nvidia_nim_api_key_opus="opus_key"
+    )
+
+    with patch("providers.openai_compat.AsyncOpenAI"):
+        sonnet_provider = registry.get(
+            "nvidia_nim", settings, claude_model="claude-sonnet-4"
+        )
+        opus_provider = registry.get(
+            "nvidia_nim", settings, claude_model="claude-opus-4"
+        )
+
+    assert sonnet_provider is not opus_provider
+    assert "nvidia_nim:sonnet" in registry._providers
+    assert "nvidia_nim:opus" in registry._providers
+
+
+def test_provider_registry_caches_same_tier():
+    registry = ProviderRegistry()
+    settings = _make_settings(nvidia_nim_api_key_sonnet="sonnet_key")
+
+    with patch("providers.openai_compat.AsyncOpenAI"):
+        first = registry.get("nvidia_nim", settings, claude_model="claude-sonnet-4")
+        second = registry.get(
+            "nvidia_nim", settings, claude_model="claude-sonnet-4-20250514"
+        )
+
+    assert first is second
+
+
+def test_provider_registry_is_cached_with_compound_key():
+    registry = ProviderRegistry()
+    settings = _make_settings(nvidia_nim_api_key_opus="opus_key")
+
+    assert not registry.is_cached(
+        "nvidia_nim", claude_model="claude-opus-4", settings=settings
+    )
+
+    with patch("providers.openai_compat.AsyncOpenAI"):
+        registry.get("nvidia_nim", settings, claude_model="claude-opus-4")
+
+    assert registry.is_cached(
+        "nvidia_nim", claude_model="claude-opus-4", settings=settings
+    )
+
+
+def test_create_provider_passes_api_key_override():
+    with patch("providers.openai_compat.AsyncOpenAI"):
+        provider = create_provider(
+            "nvidia_nim", _make_settings(), api_key_override="override_key"
+        )
+        assert isinstance(provider, NvidiaNimProvider)
+        assert provider._api_key == "override_key"

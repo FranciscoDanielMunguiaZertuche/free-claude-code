@@ -33,6 +33,7 @@ def resolve_provider(
     *,
     app: Starlette | None,
     settings: Settings,
+    claude_model: str | None = None,
 ) -> BaseProvider:
     """Resolve a provider using the app-scoped registry when ``app`` is set.
 
@@ -51,16 +52,26 @@ def resolve_provider(
                 "Provider registry is not configured. Ensure AppRuntime startup ran "
                 "or assign app.state.provider_registry for test apps."
             )
-        return _resolve_with_registry(reg, provider_type, settings)
-    return _resolve_with_registry(ProviderRegistry(_providers), provider_type, settings)
+        return _resolve_with_registry(
+            reg, provider_type, settings, claude_model=claude_model
+        )
+    return _resolve_with_registry(
+        ProviderRegistry(_providers), provider_type, settings, claude_model=claude_model
+    )
 
 
 def _resolve_with_registry(
-    registry: ProviderRegistry, provider_type: str, settings: Settings
+    registry: ProviderRegistry,
+    provider_type: str,
+    settings: Settings,
+    *,
+    claude_model: str | None = None,
 ) -> BaseProvider:
-    should_log_init = not registry.is_cached(provider_type)
+    should_log_init = not registry.is_cached(
+        provider_type, claude_model=claude_model, settings=settings
+    )
     try:
-        provider = registry.get(provider_type, settings)
+        provider = registry.get(provider_type, settings, claude_model=claude_model)
     except AuthenticationError as e:
         # Provider :class:`~providers.exceptions.AuthenticationError` messages are
         # curated configuration hints (env var names, docs links), not upstream noise.

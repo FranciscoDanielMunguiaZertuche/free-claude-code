@@ -198,5 +198,6 @@ def test_model_router_logs_mapping(settings):
     mock_log.assert_called()
     args = mock_log.call_args[0]
     assert "MODEL MAPPING" in args[0]
-    assert args[1] == "claude-2.1"
-    assert args[2] == "fallback-model"
+    assert args[1] == ""
+    assert args[2] == "claude-2.1"
+    assert args[3] == "fallback-model"

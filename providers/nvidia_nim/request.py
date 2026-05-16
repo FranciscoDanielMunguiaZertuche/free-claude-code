@@ -73,6 +73,17 @@ def _strip_chat_template_field(extra_body: dict[str, Any]) -> bool:
     return extra_body.pop("chat_template", None) is not None
 
 
+def _strip_all_thinking_extra(extra_body: dict[str, Any]) -> bool:
+    removed = False
+    for key in (
+        "chat_template_kwargs",
+        "ignore_eos",
+    ):
+        if extra_body.pop(key, None) is not None:
+            removed = True
+    return removed
+
+
 def _strip_message_reasoning_content(body: dict[str, Any]) -> bool:
     removed = False
     messages = body.get("messages")
@@ -327,6 +338,57 @@ def _set_extra(
     extra_body[key] = value
 
 
+def _reduce_reasoning_budget(extra_body: dict[str, Any]) -> bool:
+    removed = False
+    for key in ("chat_template_kwargs", "reasoning_budget"):
+        val = extra_body.pop(key, None)
+        if val is not None:
+            removed = True
+    return removed
+
+
+def clone_body_with_reduced_reasoning_budget(
+    body: dict[str, Any], target_budget: int
+) -> dict[str, Any] | None:
+    """Clone body and set reasoning_budget to *target_budget* (or remove if 0).
+
+    Reduces both top-level ``extra_body["reasoning_budget"]`` and the one
+    nested inside ``chat_template_kwargs``.  Returns ``None`` when no
+    reasoning_budget field is present at all.
+    """
+    cloned_body = deepcopy(body)
+    extra_body = cloned_body.get("extra_body")
+    if not isinstance(extra_body, dict):
+        return None
+
+    changed = False
+    if "reasoning_budget" in extra_body:
+        if target_budget > 0:
+            extra_body["reasoning_budget"] = target_budget
+        else:
+            extra_body.pop("reasoning_budget", None)
+        changed = True
+
+    chat_template_kwargs = extra_body.get("chat_template_kwargs")
+    if (
+        isinstance(chat_template_kwargs, dict)
+        and "reasoning_budget" in chat_template_kwargs
+    ):
+        if target_budget > 0:
+            chat_template_kwargs["reasoning_budget"] = target_budget
+        else:
+            chat_template_kwargs.pop("reasoning_budget", None)
+        changed = True
+
+    if not changed:
+        return None
+
+    if "max_tokens" in cloned_body and target_budget > 0:
+        cloned_body["max_tokens"] = target_budget
+
+    return cloned_body
+
+
 def clone_body_without_reasoning_budget(body: dict[str, Any]) -> dict[str, Any] | None:
     """Clone a request body and strip only reasoning_budget fields."""
     return _clone_strip_extra_body(body, _strip_reasoning_budget_fields)
@@ -335,6 +397,11 @@ def clone_body_without_reasoning_budget(body: dict[str, Any]) -> dict[str, Any] 
 def clone_body_without_chat_template(body: dict[str, Any]) -> dict[str, Any] | None:
     """Clone a request body and strip only chat_template."""
     return _clone_strip_extra_body(body, _strip_chat_template_field)
+
+
+def clone_body_without_all_thinking(body: dict[str, Any]) -> dict[str, Any] | None:
+    """Clone a request body and strip all thinking/reasoning extra_body fields."""
+    return _clone_strip_extra_body(body, _strip_all_thinking_extra)
 
 
 def clone_body_without_reasoning_content(body: dict[str, Any]) -> dict[str, Any] | None:
@@ -400,11 +467,8 @@ def build_request_body(
         extra_body.update(request_extra)
 
     if thinking_enabled:
-        chat_template_kwargs = extra_body.setdefault(
-            "chat_template_kwargs", {"thinking": True, "enable_thinking": True}
-        )
-        if isinstance(chat_template_kwargs, dict):
-            chat_template_kwargs.setdefault("reasoning_budget", max_tokens)
+        extra_body.setdefault("chat_template_kwargs", {"thinking": True})
+        _set_extra(extra_body, "thinking", True)
 
     req_top_k = getattr(request_data, "top_k", None)
     top_k = req_top_k if req_top_k is not None else nim.top_k
@@ -417,6 +481,7 @@ def build_request_body(
     _set_extra(extra_body, "chat_template", nim.chat_template)
     _set_extra(extra_body, "request_id", nim.request_id)
     _set_extra(extra_body, "ignore_eos", nim.ignore_eos)
+    _set_extra(extra_body, "reasoning_effort", nim.reasoning_effort)
 
     if extra_body:
         body["extra_body"] = extra_body

@@ -42,7 +42,7 @@ TARGET_ALIASES = {
 SECRET_KEY_PARTS = ("KEY", "TOKEN", "SECRET", "WEBHOOK", "AUTH")
 
 PROVIDER_SMOKE_DEFAULT_MODELS: dict[str, str] = {
-    "nvidia_nim": "nvidia_nim/z-ai/glm4.7",
+    "nvidia_nim": "nvidia_nim/moonshotai/kimi-k2.6",
     "open_router": "open_router/stepfun/step-3.5-flash:free",
     "deepseek": "deepseek/deepseek-v4-pro",
     "lmstudio": "lmstudio/local-model",

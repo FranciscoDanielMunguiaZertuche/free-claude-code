@@ -23,7 +23,9 @@ def test_create_message_skips_full_payload_debug_log_by_default():
         yield "event: ping\ndata: {}\n\n"
 
     mock_provider.stream_response = fake_stream
-    service = ClaudeProxyService(settings, provider_getter=lambda _: mock_provider)
+    service = ClaudeProxyService(
+        settings, provider_getter=lambda _p, **_kw: mock_provider
+    )
 
     request = MessagesRequest(
         model="claude-3-haiku-20240307",
@@ -51,7 +53,9 @@ def test_create_message_logs_full_payload_when_opt_in():
         yield "event: ping\ndata: {}\n\n"
 
     mock_provider.stream_response = fake_stream
-    service = ClaudeProxyService(settings, provider_getter=lambda _: mock_provider)
+    service = ClaudeProxyService(
+        settings, provider_getter=lambda _p, **_kw: mock_provider
+    )
     request = MessagesRequest(
         model="claude-3-haiku-20240307",
         max_tokens=10,
@@ -103,7 +107,9 @@ def test_create_message_unexpected_error_default_logs_exclude_exception_text():
         raise RuntimeError(secret)
 
     mock_provider.stream_response = stream_boom
-    service = ClaudeProxyService(settings, provider_getter=lambda _: mock_provider)
+    service = ClaudeProxyService(
+        settings, provider_getter=lambda _p, **_kw: mock_provider
+    )
     request = MessagesRequest(
         model="claude-3-haiku-20240307",
         max_tokens=10,
@@ -134,7 +140,9 @@ def test_create_message_unexpected_error_always_returns_500():
         raise WeirdError("no")
 
     mock_provider.stream_response = stream_boom
-    service = ClaudeProxyService(settings, provider_getter=lambda _: mock_provider)
+    service = ClaudeProxyService(
+        settings, provider_getter=lambda _p, **_kw: mock_provider
+    )
     request = MessagesRequest(
         model="claude-3-haiku-20240307",
         max_tokens=10,
@@ -183,7 +191,7 @@ def test_count_tokens_unexpected_error_default_logs_exclude_exception_text():
 
     service = ClaudeProxyService(
         settings,
-        provider_getter=lambda _: MagicMock(),
+        provider_getter=lambda _, **_kw: MagicMock(),
         token_counter=boom,
     )
     from api.models.anthropic import TokenCountRequest

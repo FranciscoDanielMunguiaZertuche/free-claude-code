@@ -52,6 +52,11 @@ def _make_mock_settings(**overrides):
     mock.http_write_timeout = 10.0
     mock.http_connect_timeout = 10.0
     mock.enable_model_thinking = True
+    mock.nvidia_nim_api_key_fallback = ""
+    mock.nvidia_nim_api_key_fallback2 = ""
+    mock.nvidia_nim_reasoning_effort = ""
+    mock.log_raw_sse_events = False
+    mock.log_api_error_tracebacks = False
     for key, value in overrides.items():
         setattr(mock, key, value)
     return mock
