@@ -339,8 +339,6 @@ class NvidiaNimProvider(OpenAIChatTransport):
             len(body.get("tools", [])),
         )
 
-        yield sse.message_start()
-
         rr_order = self._rr_client_order()
         async with self._global_rate_limiter.concurrency_slot():
             nonstream_exc: Exception | None = None
@@ -361,6 +359,7 @@ class NvidiaNimProvider(OpenAIChatTransport):
                         max_retries=6,
                         max_delay=120.0,
                     )
+                    yield sse.message_start()
                     for event in _convert_nonstream_to_sse(
                         response, sse, thinking_enabled
                     ):
@@ -400,6 +399,7 @@ class NvidiaNimProvider(OpenAIChatTransport):
                                     stream=False,
                                 )
                             )
+                            yield sse.message_start()
                             for event in _convert_nonstream_to_sse(
                                 response, sse, thinking_enabled
                             ):
@@ -420,6 +420,7 @@ class NvidiaNimProvider(OpenAIChatTransport):
                                         **retry_body_2,
                                         stream=False,
                                     )
+                                    yield sse.message_start()
                                     for event in _convert_nonstream_to_sse(
                                         response, sse, thinking_enabled
                                     ):
@@ -459,6 +460,7 @@ class NvidiaNimProvider(OpenAIChatTransport):
                         len(self._fallback_clients),
                     )
                 try:
+                    yield sse.message_start()
                     async for event in self._streaming_fallback_with_client(
                         body, sse, thinking_enabled, req_tag, active_client
                     ):
@@ -477,6 +479,7 @@ class NvidiaNimProvider(OpenAIChatTransport):
 
         if nonstream_exc is not None:
             self._log_nim_error(nonstream_exc, "NIM_NONSTREAM", req_tag)
+            yield sse.message_start()
             for event in sse.close_all_blocks():
                 yield event
             mapped_e = map_error(nonstream_exc, rate_limiter=self._global_rate_limiter)
