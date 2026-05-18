@@ -164,6 +164,7 @@ class NvidiaNimProvider(OpenAIChatTransport):
         openai.RateLimitError,
         openai.APITimeoutError,
         httpx.ReadTimeout,
+        httpx.RemoteProtocolError,
     )
 
     @staticmethod
@@ -250,6 +251,118 @@ class NvidiaNimProvider(OpenAIChatTransport):
     def _tool_argument_aliases(self, body: dict[str, Any]) -> dict[str, dict[str, str]]:
         """Return NIM tool argument aliases captured while building this request."""
         return nim_tool_argument_aliases_from_body(body)
+
+    async def _create_stream(self, body: dict) -> tuple[Any, dict]:
+        """Create a streaming chat completion with timeout retry across keys.
+
+        NIM upstream stalls are transient — the server sometimes never sends
+        response headers within the read timeout, but a retry typically
+        succeeds instantly. We retry once on the same key after a short delay,
+        then advance through remaining keys in round-robin order.
+
+        ``self._client`` is already set to the correct key by the caller
+        (``_streaming_path_with_fallback``), so the initial attempt uses it
+        directly. On failure we rotate through ``_fallback_clients``.
+        """
+        create_body = self._prepare_create_body(body)
+
+        async def _try_create(client: openai.AsyncOpenAI) -> Any:
+            return await self._global_rate_limiter.execute_with_retry(
+                client.chat.completions.create, **create_body, stream=True
+            )
+
+        # 1. First attempt on the already-selected client
+        hit_timeout = False
+        last_exc: Exception | None = None
+        try:
+            stream = await _try_create(self._client)
+            return stream, body
+        except (openai.APITimeoutError, httpx.ReadTimeout) as e:
+            hit_timeout = True
+            last_exc = e
+            logger.warning(
+                "NIM_CREATE_STREAM: {} on primary key, retrying same key after 5s",
+                type(e).__name__,
+            )
+        except self._RETRYABLE_EXC as e:
+            last_exc = e
+            logger.warning(
+                "NIM_CREATE_STREAM: {} on primary key, advancing to fallbacks",
+                type(e).__name__,
+            )
+        except openai.BadRequestError as e:
+            retry_body = self._get_retry_request_body(e, body)
+            if retry_body is None:
+                raise
+            create_retry_body = self._prepare_create_body(retry_body)
+            try:
+                stream = await self._global_rate_limiter.execute_with_retry(
+                    self._client.chat.completions.create,
+                    **create_retry_body,
+                    stream=True,
+                )
+                return stream, retry_body
+            except self._RETRYABLE_EXC:
+                pass
+
+        # 2. Same-key timeout retry — only when the first attempt timed out.
+        # NIM stalls are transient; a retry typically succeeds instantly.
+        # Rate limits (429) skip this and go straight to fallback keys.
+        if hit_timeout:
+            try:
+                await asyncio.sleep(5)
+                stream = await _try_create(self._client)
+                return stream, body
+            except (openai.APITimeoutError, httpx.ReadTimeout) as e:
+                last_exc = e
+                logger.warning(
+                    "NIM_CREATE_STREAM: timeout on same-key retry, trying fallbacks"
+                )
+            except self._RETRYABLE_EXC as e:
+                last_exc = e
+                logger.warning(
+                    "NIM_CREATE_STREAM: {} on same-key retry, trying fallbacks",
+                    type(e).__name__,
+                )
+
+        # 3. Fallback keys
+        for fb_idx, fb_client in enumerate(self._fallback_clients):
+            logger.warning(
+                "NIM_CREATE_STREAM: trying fallback key #{}/{}",
+                fb_idx + 1,
+                len(self._fallback_clients),
+            )
+            try:
+                stream = await _try_create(fb_client)
+                return stream, body
+            except (openai.APITimeoutError, httpx.ReadTimeout) as e:
+                last_exc = e
+                try:
+                    await asyncio.sleep(5)
+                    stream = await _try_create(fb_client)
+                    return stream, body
+                except self._RETRYABLE_EXC as retry_exc:
+                    last_exc = retry_exc
+            except self._RETRYABLE_EXC as e:
+                last_exc = e
+            except openai.BadRequestError as e:
+                retry_body = self._get_retry_request_body(e, body)
+                if retry_body is None:
+                    raise
+                create_retry_body = self._prepare_create_body(retry_body)
+                try:
+                    stream = await self._global_rate_limiter.execute_with_retry(
+                        fb_client.chat.completions.create,
+                        **create_retry_body,
+                        stream=True,
+                    )
+                    return stream, retry_body
+                except self._RETRYABLE_EXC as retry_exc:
+                    last_exc = retry_exc
+
+        if last_exc is not None:
+            raise last_exc
+        raise openai.APITimeoutError(request=httpx.Request("POST", self._base_url))
 
     def _next_client(self) -> tuple[openai.AsyncOpenAI, int]:
         """Return the next client in round-robin rotation and its index.
@@ -635,10 +748,17 @@ class NvidiaNimProvider(OpenAIChatTransport):
         *,
         thinking_enabled: bool | None,
     ) -> AsyncIterator[str]:
-        """Stream with round-robin key selection and automatic fallback on 429 or timeout."""
+        """Stream with round-robin key selection and automatic fallback on transport errors.
+
+        Timeout retry at the connection level is handled by ``_create_stream``.
+        This method covers mid-stream transport errors (e.g. ``RemoteProtocolError``
+        from NIM abruptly closing the connection). The parent's ``_stream_response_impl``
+        catches these and emits error SSE events — we detect that and retry on the
+        next key, but only when no content has been emitted yet (retrying after
+        partial content would produce duplicate output).
+        """
         req_tag = f" request_id={request_id}" if request_id else ""
         rr_order = self._rr_client_order()
-        last_exc: Exception | None = None
         for attempt_idx, client in enumerate(rr_order):
             if attempt_idx > 0:
                 logger.warning(
@@ -647,31 +767,53 @@ class NvidiaNimProvider(OpenAIChatTransport):
                     attempt_idx + 1,
                     len(rr_order),
                 )
+            _original = self._client
             try:
-                _original = self._client
-                try:
-                    self._client = client
-                    async for event in self._streaming_path(
-                        request,
-                        input_tokens,
-                        request_id,
-                        thinking_enabled=thinking_enabled,
-                    ):
+                self._client = client
+                got_content = False
+                pending_events: list[str] = []
+                async for event in self._streaming_path(
+                    request,
+                    input_tokens,
+                    request_id,
+                    thinking_enabled=thinking_enabled,
+                ):
+                    is_error = '"error"' in event and (
+                        "peer closed" in event.lower()
+                        or "incomplete chunked" in event.lower()
+                        or "timed out" in event.lower()
+                        or "connection" in event.lower()
+                    )
+                    is_content = '"content_block_start"' in event or '"text_delta"' in event
+                    if is_content:
+                        got_content = True
+                    if is_error and not got_content:
+                        logger.warning(
+                            "NIM_STREAM:{} early transport error (no content yet), "
+                            "raising for key rotation",
+                            req_tag,
+                        )
+                        raise httpx.RemoteProtocolError(
+                            "peer closed connection without sending complete message body"
+                        )
+                    if not got_content:
+                        pending_events.append(event)
+                    else:
+                        for pending in pending_events:
+                            yield pending
+                        pending_events.clear()
                         yield event
-                    return
-                finally:
-                    self._client = _original
-            except self._RETRYABLE_EXC as e:
-                last_exc = e
+                return
+            except self._RETRYABLE_EXC:
                 logger.warning(
-                    "NIM_STREAM:{} {} on key #{}/{}, continuing",
+                    "NIM_STREAM:{} transport error on key #{}/{}, advancing",
                     req_tag,
-                    type(e).__name__,
                     attempt_idx + 1,
                     len(rr_order),
                 )
-        if last_exc is not None:
-            raise last_exc
+                continue
+            finally:
+                self._client = _original
 
     async def _streaming_path(
         self,

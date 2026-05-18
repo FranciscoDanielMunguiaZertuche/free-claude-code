@@ -40,6 +40,8 @@ def _create_nvidia_nim(config: ProviderConfig, settings: Settings) -> BaseProvid
         fallback_keys.append(settings.nvidia_nim_api_key_fallback)
     if settings.nvidia_nim_api_key_fallback2:
         fallback_keys.append(settings.nvidia_nim_api_key_fallback2)
+    if settings.nvidia_nim_api_key_fallback3:
+        fallback_keys.append(settings.nvidia_nim_api_key_fallback3)
     nim_settings = settings.nim
     if settings.nvidia_nim_reasoning_effort:
         nim_settings = nim_settings.model_copy(

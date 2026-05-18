@@ -1299,6 +1299,47 @@ async def test_nonstream_tools_emits_error_on_timeout_both_fail(nim_provider):
 
 
 @pytest.mark.asyncio
+async def test_create_stream_timeout_retry_succeeds(nim_provider):
+    """_create_stream retries once on timeout and returns the stream on retry."""
+    req = MockRequest()
+    timeout_error = openai.APITimeoutError(request=Request("POST", "http://test"))
+
+    mock_chunk = MagicMock()
+    mock_chunk.choices = [
+        MagicMock(
+            delta=MagicMock(content="hello", reasoning_content=None, tool_calls=None),
+            finish_reason="stop",
+        )
+    ]
+    mock_chunk.usage = MagicMock(completion_tokens=1, prompt_tokens=5)
+    mock_stream = MagicMock()
+    mock_stream.__aiter__ = MagicMock(return_value=iter([mock_chunk]))
+
+    call_count = 0
+
+    async def _flip_side_effect(fn, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise timeout_error
+        return mock_stream
+
+    with (
+        patch.object(
+            nim_provider._global_rate_limiter,
+            "execute_with_retry",
+            new_callable=AsyncMock,
+            side_effect=_flip_side_effect,
+        ),
+        patch("providers.nvidia_nim.client.asyncio.sleep", new_callable=AsyncMock),
+    ):
+        events = [e async for e in nim_provider.stream_response(req)]
+
+    event_text = "".join(events)
+    assert "event: message_stop" in event_text
+    assert call_count == 2
+
+@pytest.mark.asyncio
 async def test_nonstream_tools_streaming_fallback_fixes_broken_tool_calls(
     nim_provider,
 ):

@@ -54,6 +54,7 @@ def _make_mock_settings(**overrides):
     mock.enable_model_thinking = True
     mock.nvidia_nim_api_key_fallback = ""
     mock.nvidia_nim_api_key_fallback2 = ""
+    mock.nvidia_nim_api_key_fallback3 = ""
     mock.nvidia_nim_reasoning_effort = ""
     mock.log_raw_sse_events = False
     mock.log_api_error_tracebacks = False
