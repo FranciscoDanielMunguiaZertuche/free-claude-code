@@ -159,6 +159,9 @@ class Settings(BaseSettings):
     nvidia_nim_api_key_fallback2: str = Field(
         default="", validation_alias="NVIDIA_NIM_API_KEY_FALLBACK2"
     )
+    nvidia_nim_api_key_fallback3: str = Field(
+        default="", validation_alias="NVIDIA_NIM_API_KEY_FALLBACK3"
+    )
     nvidia_nim_reasoning_effort: str = Field(
         default="", validation_alias="NIM_REASONING_EFFORT"
     )
