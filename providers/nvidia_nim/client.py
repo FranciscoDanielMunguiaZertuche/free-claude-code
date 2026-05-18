@@ -165,7 +165,16 @@ class NvidiaNimProvider(OpenAIChatTransport):
         openai.APITimeoutError,
         httpx.ReadTimeout,
         httpx.RemoteProtocolError,
+        httpx.ConnectError,
+        httpx.ConnectTimeout,
+        ConnectionError,
     )
+
+    _NETWORK_DOWN_EXC: tuple[type[Exception], ...] = (
+        httpx.ConnectError,
+        httpx.ConnectTimeout,
+        ConnectionError,
+    )  # Exceptions indicating network is unreachable — retrying other keys is pointless.
 
     @staticmethod
     def _log_nim_error(exc: Exception, tag: str, req_tag: str) -> None:
@@ -784,7 +793,9 @@ class NvidiaNimProvider(OpenAIChatTransport):
                         or "timed out" in event.lower()
                         or "connection" in event.lower()
                     )
-                    is_content = '"content_block_start"' in event or '"text_delta"' in event
+                    is_content = (
+                        '"content_block_start"' in event or '"text_delta"' in event
+                    )
                     if is_content:
                         got_content = True
                     if is_error and not got_content:
