@@ -223,7 +223,7 @@ class HeuristicToolParser:
                             filtered_output_parts.append(pre_match_text)
 
                         key = param_match.group(1).strip()
-                        val = param_match.group(2).strip()
+                        val = param_match.group(2)
                         self._current_parameters[key] = val
                         self._buffer = self._buffer[param_match.end() :]
                     else:
@@ -271,7 +271,7 @@ class HeuristicToolParser:
             )
             for match in partial_matches:
                 key = match.group(1).strip()
-                val = match.group(2).strip()
+                val = match.group(2)
                 self._current_parameters[key] = val
 
             detected_tools.append(
