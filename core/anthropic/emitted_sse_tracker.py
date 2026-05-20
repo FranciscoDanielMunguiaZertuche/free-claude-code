@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import Iterator
 from contextlib import suppress
@@ -17,6 +18,8 @@ class EmittedNativeSseTracker:
     def __init__(self) -> None:
         self._buf = ""
         self._open_stack: list[int] = []
+        self._block_types: dict[int, str] = {}
+        self._tool_json_fragments: dict[int, list[str]] = {}
         self._max_index = -1
         self.message_id: str | None = None
         self.model: str = ""
@@ -51,24 +54,71 @@ class EmittedNativeSseTracker:
             idx = event_index(event)
             self._max_index = max(self._max_index, idx)
             self._open_stack.append(idx)
+            block = event.data.get("content_block", {})
+            if isinstance(block, dict):
+                self._block_types[idx] = str(block.get("type", ""))
+            return
+
+        if event.event == "content_block_delta":
+            idx = event.data.get("index")
+            if not isinstance(idx, int):
+                return
+            delta = event.data.get("delta", {})
+            if (
+                isinstance(delta, dict)
+                and delta.get("type") == "input_json_delta"
+                and self._block_types.get(idx) == "tool_use"
+            ):
+                partial = delta.get("partial_json", "")
+                if partial:
+                    self._tool_json_fragments.setdefault(idx, []).append(partial)
             return
 
         if event.event == "content_block_stop":
-            idx = event_index(event)
-            if self._open_stack and self._open_stack[-1] == idx:
-                self._open_stack.pop()
-            else:
-                with suppress(ValueError):
-                    self._open_stack.remove(idx)
+            idx = event.data.get("index")
+            if isinstance(idx, int):
+                if self._open_stack and self._open_stack[-1] == idx:
+                    self._open_stack.pop()
+                else:
+                    with suppress(ValueError):
+                        self._open_stack.remove(idx)
+                self._block_types.pop(idx, None)
+                self._tool_json_fragments.pop(idx, None)
 
     def next_content_index(self) -> int:
         """Next unused content block index based on emitted starts."""
         return self._max_index + 1
 
     def iter_close_unclosed_blocks(self) -> Iterator[str]:
-        """Yield ``content_block_stop`` events for blocks that were started but not stopped."""
+        """Yield rescue deltas + ``content_block_stop`` for blocks started but not stopped.
+
+        For tool_use blocks with invalid accumulated JSON, a rescue
+        ``input_json_delta`` is emitted before ``content_block_stop`` so
+        that downstream clients (Claude Code) don't fail with
+        "tool call could not be parsed".
+        """
         while self._open_stack:
             idx = self._open_stack.pop()
+            if self._block_types.get(idx) == "tool_use" and idx in self._tool_json_fragments:
+                concatenated = "".join(self._tool_json_fragments[idx])
+                if concatenated.strip():
+                    try:
+                        json.loads(concatenated)
+                    except (json.JSONDecodeError, ValueError):
+                        rescue = SSEBuilder._rescue_partial_json(concatenated)
+                        yield format_sse_event(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": idx,
+                                "delta": {
+                                    "type": "input_json_delta",
+                                    "partial_json": rescue,
+                                },
+                            },
+                        )
+            self._block_types.pop(idx, None)
+            self._tool_json_fragments.pop(idx, None)
             yield format_sse_event(
                 "content_block_stop",
                 {"type": "content_block_stop", "index": idx},

@@ -374,6 +374,107 @@ class SSEBuilder:
         if self.blocks.text_started:
             yield self.stop_text_block()
 
+    def close_incomplete_tool_blocks(self) -> Iterator[str]:
+        """Emit completing deltas for tool blocks with invalid accumulated JSON.
+
+        When a transport error interrupts a stream mid-tool-call, the
+        input_json_delta fragments already sent may concatenate to invalid
+        JSON. Claude Code then fails with "tool call could not be parsed".
+
+        This method checks each started tool block: if the fragments form valid
+        JSON, do nothing (the block is fine). If they don't, emit one final
+        input_json_delta that produces valid JSON — either by completing the
+        partial object or by replacing it with {"_interrupted": true}.
+
+        Must be called **before** close_all_blocks so the rescue delta
+        arrives before content_block_stop.
+        """
+        for _tool_index, state in list(self.blocks.tool_states.items()):
+            if not state.started or not state.contents:
+                continue
+            concatenated = "".join(state.contents)
+            if not concatenated.strip():
+                continue
+            try:
+                json.loads(concatenated)
+                continue
+            except json.JSONDecodeError, ValueError:
+                pass
+            rescue = self._rescue_partial_json(concatenated)
+            state.contents.append(rescue)
+            yield self.content_block_delta(
+                state.block_index, "input_json_delta", rescue
+            )
+
+    @staticmethod
+    def _rescue_partial_json(partial: str) -> str:
+        """Return a JSON fragment that when appended to *partial* yields valid JSON.
+
+        Strategy:
+        1. Close any unterminated string literal.
+        2. Close all open braces/brackets in reverse nesting order.
+        3. If the result still isn't valid JSON, fall back to
+        {"_interrupted": true} sent as a fresh delta (prefixed with
+        enough closing chars to terminate the old partial).
+        """
+        s = partial.strip()
+        if not s:
+            return '{"_interrupted": true}'
+
+        in_string = False
+        escape_next = False
+        open_stack: list[str] = []
+        for ch in s:
+            if escape_next:
+                escape_next = False
+                continue
+            if ch == "\\" and in_string:
+                escape_next = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "{":
+                open_stack.append("}")
+            elif ch == "[":
+                open_stack.append("]")
+            elif ch in ("}", "]") and open_stack:
+                open_stack.pop()
+
+        suffix = ""
+        if in_string:
+            suffix += '"'
+
+        candidate = s + suffix
+        if open_stack and open_stack[-1] == "}" and not in_string:
+            stripped = candidate.rstrip()
+            if stripped.endswith(":"):
+                suffix += " null"
+            elif stripped.endswith(","):
+                suffix += '"_truncated": null'
+
+        for bracket in reversed(open_stack):
+            suffix += bracket
+
+        candidate = s + suffix
+        try:
+            json.loads(candidate)
+            return suffix
+        except json.JSONDecodeError, ValueError:
+            pass
+
+        close_brackets = "".join(reversed(open_stack))
+        candidate2 = s + ('"' if in_string else "") + " null" + close_brackets
+        try:
+            json.loads(candidate2)
+            return candidate2[len(s) :]
+        except json.JSONDecodeError, ValueError:
+            pass
+
+        return '{"_interrupted": true}'
+
     def close_all_blocks(self) -> Iterator[str]:
         yield from self.close_content_blocks()
         for tool_index, state in list(self.blocks.tool_states.items()):

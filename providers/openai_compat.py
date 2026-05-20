@@ -314,10 +314,11 @@ class OpenAIChatTransport(BaseProvider):
             if not aliases:
                 continue
             restored = self._restore_aliased_tool_arguments(buffered_args, aliases)
-            yield sse.emit_tool_delta(
-                tool_index,
-                restored if restored is not None else buffered_args,
-            )
+            if restored is not None:
+                yield sse.emit_tool_delta(tool_index, restored)
+            else:
+                rescue = SSEBuilder._rescue_partial_json(buffered_args)
+                yield sse.emit_tool_delta(tool_index, rescue)
             tool_argument_alias_buffers.pop(tool_index, None)
 
     async def stream_response(
@@ -497,6 +498,8 @@ class OpenAIChatTransport(BaseProvider):
                     mapped_error_type=type(mapped_e).__name__,
                 )
                 yield sse.message_start()
+                for event in sse.close_incomplete_tool_blocks():
+                    yield event
                 for event in sse.close_all_blocks():
                     yield event
                 if sse.blocks.has_emitted_tool_block():
@@ -559,6 +562,8 @@ class OpenAIChatTransport(BaseProvider):
         for event in self._flush_task_arg_buffers(sse):
             yield event
 
+        for event in sse.close_incomplete_tool_blocks():
+            yield event
         for event in sse.close_all_blocks():
             yield event
 

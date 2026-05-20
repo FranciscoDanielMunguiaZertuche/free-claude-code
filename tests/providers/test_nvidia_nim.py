@@ -1339,6 +1339,7 @@ async def test_create_stream_timeout_retry_succeeds(nim_provider):
     assert "event: message_stop" in event_text
     assert call_count == 2
 
+
 @pytest.mark.asyncio
 async def test_nonstream_tools_streaming_fallback_fixes_broken_tool_calls(
     nim_provider,

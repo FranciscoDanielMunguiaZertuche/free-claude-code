@@ -125,6 +125,15 @@ def _convert_nonstream_to_sse(
                 )
             )
             args = tc.function.arguments or "{}"
+            try:
+                json.loads(args)
+            except (json.JSONDecodeError, ValueError):
+                logger.warning(
+                    "NIM_NONSTREAM: tool_call arguments not valid JSON (id={} len={}), falling back to {{}}",
+                    tool_id,
+                    len(args),
+                )
+                args = "{}"
             events.append(sse.emit_tool_delta(i, args))
         has_started_tool = any(s.started for s in sse.blocks.tool_states.values())
     has_content_blocks = sse.blocks.text_index != -1 or has_started_tool
@@ -602,6 +611,8 @@ class NvidiaNimProvider(OpenAIChatTransport):
         if nonstream_exc is not None:
             self._log_nim_error(nonstream_exc, "NIM_NONSTREAM", req_tag)
             yield sse.message_start()
+            for event in sse.close_incomplete_tool_blocks():
+                yield event
             for event in sse.close_all_blocks():
                 yield event
             mapped_e = map_error(nonstream_exc, rate_limiter=self._global_rate_limiter)
@@ -724,6 +735,8 @@ class NvidiaNimProvider(OpenAIChatTransport):
 
         for event in self._flush_task_arg_buffers(sse):
             yield event
+        for event in sse.close_incomplete_tool_blocks():
+            yield event
         for event in sse.close_all_blocks():
             yield event
 
@@ -787,7 +800,9 @@ class NvidiaNimProvider(OpenAIChatTransport):
                     request_id,
                     thinking_enabled=thinking_enabled,
                 ):
-                    is_error = '"error"' in event and (
+                    is_error = (
+                        '"type":"error"' in event or '"type": "error"' in event
+                    ) and (
                         "peer closed" in event.lower()
                         or "incomplete chunked" in event.lower()
                         or "timed out" in event.lower()
