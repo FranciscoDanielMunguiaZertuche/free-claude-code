@@ -585,3 +585,24 @@ class TestXmlToolCallParser:
         _remaining, tools = HeuristicToolParser.extract_xml_tool_calls(text)
         assert tools[0]["type"] == "tool_use"
         assert tools[0]["id"].startswith("toolu_xml_")
+
+    def test_xml_whitespace_stripping(self):
+        text = (
+            "<Edit>\n"
+            "  <filePath>\n    /tmp/test.txt\n  </filePath>\n"
+            "  <oldText>\n"
+            "    def foo():\n"
+            '        print("bar")\n'
+            "  </oldText>\n"
+            "  <newText>  \n"
+            "    def foo():\n"
+            '        print("baz")\n'
+            "  </newText>\n"
+            "</Edit>"
+        )
+        _remaining, tools = HeuristicToolParser.extract_xml_tool_calls(text)
+        assert len(tools) == 1
+        assert tools[0]["name"] == "Edit"
+        assert tools[0]["input"]["filePath"] == "/tmp/test.txt"
+        assert tools[0]["input"]["oldText"] == '    def foo():\n        print("bar")'
+        assert tools[0]["input"]["newText"] == '    def foo():\n        print("baz")'

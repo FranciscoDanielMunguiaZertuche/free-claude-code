@@ -40,6 +40,49 @@ _KNOWN_TOOL_NAMES = frozenset(
 )
 
 
+def _clean_xml_parameter(key: str, value: str) -> str:
+    """Clean XML-style tool call parameter values.
+
+    If the parameter is a single-line or metadata field, completely strip all leading
+    and trailing whitespace.
+
+    If the parameter is a multi-line code/text block (like `oldText`, `newText`,
+    `fileContent`, `content`), strip the formatting artifacts from XML blocks:
+    exactly one leading and trailing newline (and any spaces/tabs preceding/succeeding
+    them on those lines), without touching the inner content.
+    """
+    if not value.strip():
+        return ""
+
+    single_line_keys = {
+        "filepath",
+        "path",
+        "pattern",
+        "include",
+        "url",
+        "command",
+        "id",
+        "name",
+        "task",
+        "query",
+    }
+    if key.lower() in single_line_keys:
+        return value.strip()
+
+    # Match a leading newline, possibly preceded by spaces/tabs
+    cleaned = value
+    leading_match = re.match(r"^[ \t]*\r?\n", cleaned)
+    if leading_match:
+        cleaned = cleaned[leading_match.end() :]
+
+    # Match a trailing newline, possibly followed by spaces/tabs
+    trailing_match = re.search(r"\r?\n[ \t]*$", cleaned)
+    if trailing_match:
+        cleaned = cleaned[: trailing_match.start()]
+
+    return cleaned
+
+
 class ParserState(Enum):
     TEXT = 1
     MATCHING_FUNCTION = 2
@@ -94,7 +137,7 @@ class HeuristicToolParser:
             for param_match in _XML_PARAM_RE.finditer(params_text):
                 key = param_match.group("key")
                 value = param_match.group("value")
-                params[key] = value
+                params[key] = _clean_xml_parameter(key, value)
 
             if not params:
                 continue
@@ -224,7 +267,7 @@ class HeuristicToolParser:
 
                         key = param_match.group(1).strip()
                         val = param_match.group(2)
-                        self._current_parameters[key] = val
+                        self._current_parameters[key] = _clean_xml_parameter(key, val)
                         self._buffer = self._buffer[param_match.end() :]
                     else:
                         break
@@ -272,7 +315,7 @@ class HeuristicToolParser:
             for match in partial_matches:
                 key = match.group(1).strip()
                 val = match.group(2)
-                self._current_parameters[key] = val
+                self._current_parameters[key] = _clean_xml_parameter(key, val)
 
             detected_tools.append(
                 {
