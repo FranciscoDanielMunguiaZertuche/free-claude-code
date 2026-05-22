@@ -99,12 +99,15 @@ class EmittedNativeSseTracker:
         """
         while self._open_stack:
             idx = self._open_stack.pop()
-            if self._block_types.get(idx) == "tool_use" and idx in self._tool_json_fragments:
+            if (
+                self._block_types.get(idx) == "tool_use"
+                and idx in self._tool_json_fragments
+            ):
                 concatenated = "".join(self._tool_json_fragments[idx])
                 if concatenated.strip():
                     try:
                         json.loads(concatenated)
-                    except (json.JSONDecodeError, ValueError):
+                    except json.JSONDecodeError, ValueError:
                         rescue = SSEBuilder._rescue_partial_json(concatenated)
                         yield format_sse_event(
                             "content_block_delta",

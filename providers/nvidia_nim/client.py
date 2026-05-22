@@ -1,6 +1,7 @@
 """NVIDIA NIM provider implementation."""
 
 import asyncio
+import contextvars
 import json
 import threading
 import uuid
@@ -37,6 +38,10 @@ from .request import (
     clone_body_without_reasoning_budget,
     clone_body_without_reasoning_content,
     nim_tool_argument_aliases_from_body,
+)
+
+_nim_active_client: contextvars.ContextVar[openai.AsyncOpenAI | None] = (
+    contextvars.ContextVar("nim_active_client", default=None)
 )
 
 
@@ -127,7 +132,7 @@ def _convert_nonstream_to_sse(
             args = tc.function.arguments or "{}"
             try:
                 json.loads(args)
-            except (json.JSONDecodeError, ValueError):
+            except json.JSONDecodeError, ValueError:
                 logger.warning(
                     "NIM_NONSTREAM: tool_call arguments not valid JSON (id={} len={}), falling back to {{}}",
                     tool_id,
@@ -271,43 +276,41 @@ class NvidiaNimProvider(OpenAIChatTransport):
         return nim_tool_argument_aliases_from_body(body)
 
     async def _create_stream(self, body: dict) -> tuple[Any, dict]:
-        """Create a streaming chat completion with timeout retry across keys.
+        """Create a streaming chat completion with timeout retry on the current key.
 
         NIM upstream stalls are transient — the server sometimes never sends
         response headers within the read timeout, but a retry typically
-        succeeds instantly. We retry once on the same key after a short delay,
-        then advance through remaining keys in round-robin order.
-
-        ``self._client`` is already set to the correct key by the caller
-        (``_streaming_path_with_fallback``), so the initial attempt uses it
-        directly. On failure we rotate through ``_fallback_clients``.
+        succeeds instantly. We retry once on the same key after a short delay.
+        If it fails again, we bubble the exception to _streaming_path_with_fallback
+        which handles rotation across keys.
         """
         create_body = self._prepare_create_body(body)
+        active_client = _nim_active_client.get() or self._client
 
         async def _try_create(client: openai.AsyncOpenAI) -> Any:
             return await self._global_rate_limiter.execute_with_retry(
                 client.chat.completions.create, **create_body, stream=True
             )
 
-        # 1. First attempt on the already-selected client
+        # 1. First attempt on the active client
         hit_timeout = False
         last_exc: Exception | None = None
         try:
-            stream = await _try_create(self._client)
+            stream = await _try_create(active_client)
             return stream, body
         except (openai.APITimeoutError, httpx.ReadTimeout) as e:
             hit_timeout = True
             last_exc = e
             logger.warning(
-                "NIM_CREATE_STREAM: {} on primary key, retrying same key after 5s",
+                "NIM_CREATE_STREAM: {} on current key, retrying same key after 5s",
                 type(e).__name__,
             )
         except self._RETRYABLE_EXC as e:
-            last_exc = e
             logger.warning(
-                "NIM_CREATE_STREAM: {} on primary key, advancing to fallbacks",
+                "NIM_CREATE_STREAM: {} on current key, advancing",
                 type(e).__name__,
             )
+            raise
         except openai.BadRequestError as e:
             retry_body = self._get_retry_request_body(e, body)
             if retry_body is None:
@@ -315,68 +318,31 @@ class NvidiaNimProvider(OpenAIChatTransport):
             create_retry_body = self._prepare_create_body(retry_body)
             try:
                 stream = await self._global_rate_limiter.execute_with_retry(
-                    self._client.chat.completions.create,
+                    active_client.chat.completions.create,
                     **create_retry_body,
                     stream=True,
                 )
                 return stream, retry_body
             except self._RETRYABLE_EXC:
-                pass
+                raise
 
-        # 2. Same-key timeout retry — only when the first attempt timed out.
-        # NIM stalls are transient; a retry typically succeeds instantly.
-        # Rate limits (429) skip this and go straight to fallback keys.
+        # 2. Same-key timeout retry
         if hit_timeout:
             try:
                 await asyncio.sleep(5)
-                stream = await _try_create(self._client)
+                stream = await _try_create(active_client)
                 return stream, body
-            except (openai.APITimeoutError, httpx.ReadTimeout) as e:
-                last_exc = e
+            except openai.APITimeoutError, httpx.ReadTimeout:
                 logger.warning(
-                    "NIM_CREATE_STREAM: timeout on same-key retry, trying fallbacks"
+                    "NIM_CREATE_STREAM: timeout on same-key retry, advancing"
                 )
+                raise
             except self._RETRYABLE_EXC as e:
-                last_exc = e
                 logger.warning(
-                    "NIM_CREATE_STREAM: {} on same-key retry, trying fallbacks",
+                    "NIM_CREATE_STREAM: {} on same-key retry, advancing",
                     type(e).__name__,
                 )
-
-        # 3. Fallback keys
-        for fb_idx, fb_client in enumerate(self._fallback_clients):
-            logger.warning(
-                "NIM_CREATE_STREAM: trying fallback key #{}/{}",
-                fb_idx + 1,
-                len(self._fallback_clients),
-            )
-            try:
-                stream = await _try_create(fb_client)
-                return stream, body
-            except (openai.APITimeoutError, httpx.ReadTimeout) as e:
-                last_exc = e
-                try:
-                    await asyncio.sleep(5)
-                    stream = await _try_create(fb_client)
-                    return stream, body
-                except self._RETRYABLE_EXC as retry_exc:
-                    last_exc = retry_exc
-            except self._RETRYABLE_EXC as e:
-                last_exc = e
-            except openai.BadRequestError as e:
-                retry_body = self._get_retry_request_body(e, body)
-                if retry_body is None:
-                    raise
-                create_retry_body = self._prepare_create_body(retry_body)
-                try:
-                    stream = await self._global_rate_limiter.execute_with_retry(
-                        fb_client.chat.completions.create,
-                        **create_retry_body,
-                        stream=True,
-                    )
-                    return stream, retry_body
-                except self._RETRYABLE_EXC as retry_exc:
-                    last_exc = retry_exc
+                raise
 
         if last_exc is not None:
             raise last_exc
@@ -789,9 +755,8 @@ class NvidiaNimProvider(OpenAIChatTransport):
                     attempt_idx + 1,
                     len(rr_order),
                 )
-            _original = self._client
+            token = _nim_active_client.set(client)
             try:
-                self._client = client
                 got_content = False
                 pending_events: list[str] = []
                 async for event in self._streaming_path(
@@ -800,14 +765,7 @@ class NvidiaNimProvider(OpenAIChatTransport):
                     request_id,
                     thinking_enabled=thinking_enabled,
                 ):
-                    is_error = (
-                        '"type":"error"' in event or '"type": "error"' in event
-                    ) and (
-                        "peer closed" in event.lower()
-                        or "incomplete chunked" in event.lower()
-                        or "timed out" in event.lower()
-                        or "connection" in event.lower()
-                    )
+                    is_error = '"type":"error"' in event or '"type": "error"' in event
                     is_content = (
                         '"content_block_start"' in event or '"text_delta"' in event
                     )
@@ -839,7 +797,7 @@ class NvidiaNimProvider(OpenAIChatTransport):
                 )
                 continue
             finally:
-                self._client = _original
+                _nim_active_client.reset(token)
 
     async def _streaming_path(
         self,
