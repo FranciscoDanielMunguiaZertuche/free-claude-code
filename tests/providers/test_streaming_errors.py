@@ -828,13 +828,8 @@ class TestStreamChunkEdgeCases:
                 return_value=False,
             ),
         ):
-            events = await _collect_stream(provider, request)
-
-        event_text = "".join(events)
-        assert "Partial" in event_text
-        assert "Connection reset" in event_text
-        assert "message_stop" in event_text
-        _assert_no_content_deltas_after_error_text(events, "Connection reset")
+            with pytest.raises(ConnectionResetError):
+                await _collect_stream(provider, request)
 
     def test_stream_malformed_tool_args_chunked(self):
         """Chunked tool args that never form valid JSON are flushed with {}."""

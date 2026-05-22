@@ -29,6 +29,7 @@ from providers.error_mapping import (
     map_error,
     user_visible_message_for_mapped_provider_error,
 )
+from providers.exceptions import MidStreamDisconnectError
 from providers.model_listing import extract_openai_model_ids
 from providers.rate_limit import GlobalRateLimiter
 
@@ -207,24 +208,15 @@ class OpenAIChatTransport(BaseProvider):
             if parsed is not None:
                 yield sse.emit_tool_delta(tc_index, json.dumps(parsed))
             return
-        aliases = (
-            tool_argument_aliases.get(state.name, {}) if tool_argument_aliases else {}
-        )
-        if aliases:
-            if tool_argument_alias_buffers is None:
-                restored = self._restore_aliased_tool_arguments(args, aliases)
-                if restored is not None:
-                    yield sse.emit_tool_delta(tc_index, restored)
-                return
 
-            buffered_args = tool_argument_alias_buffers.get(tc_index, "") + args
-            restored = self._restore_aliased_tool_arguments(buffered_args, aliases)
-            if restored is None:
-                tool_argument_alias_buffers[tc_index] = buffered_args
-                return
-            tool_argument_alias_buffers.pop(tc_index, None)
-            yield sse.emit_tool_delta(tc_index, restored)
+        # Always buffer tool arguments unconditionally to allow for markdown stripping
+        # and JSON repair at the end of the block.
+        if tool_argument_alias_buffers is not None:
+            tool_argument_alias_buffers[tc_index] = (
+                tool_argument_alias_buffers.get(tc_index, "") + args
+            )
             return
+
         yield sse.emit_tool_delta(tc_index, args)
 
     def _process_tool_call(
@@ -310,15 +302,37 @@ class OpenAIChatTransport(BaseProvider):
             state = sse.blocks.tool_states.get(tool_index)
             if state is None or state.name == "Task":
                 continue
-            aliases = tool_argument_aliases.get(state.name, {})
-            if not aliases:
-                continue
-            restored = self._restore_aliased_tool_arguments(buffered_args, aliases)
-            if restored is not None:
-                yield sse.emit_tool_delta(tool_index, restored)
+            cleaned_args = buffered_args.strip()
+            if cleaned_args.startswith("```json"):
+                cleaned_args = cleaned_args[7:]
+            elif cleaned_args.startswith("```"):
+                cleaned_args = cleaned_args[3:]
+            if cleaned_args.endswith("```"):
+                cleaned_args = cleaned_args[:-3]
+            cleaned_args = cleaned_args.strip()
+
+            aliases = (
+                tool_argument_aliases.get(state.name, {})
+                if tool_argument_aliases
+                else {}
+            )
+            if aliases:
+                restored = self._restore_aliased_tool_arguments(cleaned_args, aliases)
+                if restored is not None:
+                    yield sse.emit_tool_delta(tool_index, restored)
+                else:
+                    rescue = SSEBuilder._rescue_partial_json(cleaned_args)
+                    yield sse.emit_tool_delta(tool_index, rescue)
             else:
-                rescue = SSEBuilder._rescue_partial_json(buffered_args)
-                yield sse.emit_tool_delta(tool_index, rescue)
+                try:
+                    import json
+
+                    json.loads(cleaned_args)
+                    yield sse.emit_tool_delta(tool_index, cleaned_args)
+                except Exception:
+                    rescue = SSEBuilder._rescue_partial_json(cleaned_args)
+                    yield sse.emit_tool_delta(tool_index, rescue)
+
             tool_argument_alias_buffers.pop(tool_index, None)
 
     async def stream_response(
@@ -481,6 +495,23 @@ class OpenAIChatTransport(BaseProvider):
             except asyncio.CancelledError, GeneratorExit:
                 raise
             except Exception as e:
+                # If we've started emitting content and encounter a network error, raise MidStreamDisconnectError
+                # so the caller (NIM client) can auto-resume the stream.
+                if isinstance(
+                    e,
+                    (
+                        httpx.RemoteProtocolError,
+                        httpx.ReadTimeout,
+                        httpx.ConnectError,
+                        ConnectionError,
+                        httpx.ConnectTimeout,
+                    ),
+                ) and (sse.accumulated_text or sse.accumulated_reasoning):
+                    raise MidStreamDisconnectError(
+                        accumulated_text=sse.accumulated_text,
+                        accumulated_reasoning=sse.accumulated_reasoning,
+                        original_exc=e,
+                    ) from e
                 self._log_stream_transport_error(tag, req_tag, e, request_id=request_id)
                 mapped_e = map_error(e, rate_limiter=self._global_rate_limiter)
                 base_message = user_visible_message_for_mapped_provider_error(

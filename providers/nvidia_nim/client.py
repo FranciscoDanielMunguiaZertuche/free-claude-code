@@ -28,6 +28,7 @@ from providers.error_mapping import (
     map_error,
     user_visible_message_for_mapped_provider_error,
 )
+from providers.exceptions import MidStreamDisconnectError
 from providers.openai_compat import OpenAIChatTransport, _iter_heuristic_tool_use_sse
 
 from .request import (
@@ -747,6 +748,9 @@ class NvidiaNimProvider(OpenAIChatTransport):
         """
         req_tag = f" request_id={request_id}" if request_id else ""
         rr_order = self._rr_client_order()
+        current_request = request
+        is_resume = False
+
         for attempt_idx, client in enumerate(rr_order):
             if attempt_idx > 0:
                 logger.warning(
@@ -760,7 +764,7 @@ class NvidiaNimProvider(OpenAIChatTransport):
                 got_content = False
                 pending_events: list[str] = []
                 async for event in self._streaming_path(
-                    request,
+                    current_request,
                     input_tokens,
                     request_id,
                     thinking_enabled=thinking_enabled,
@@ -780,6 +784,12 @@ class NvidiaNimProvider(OpenAIChatTransport):
                         raise httpx.RemoteProtocolError(
                             "peer closed connection without sending complete message body"
                         )
+
+                    if is_resume and (
+                        '"message_start"' in event or '"content_block_start"' in event
+                    ):
+                        continue
+
                     if not got_content:
                         pending_events.append(event)
                     else:
@@ -788,6 +798,37 @@ class NvidiaNimProvider(OpenAIChatTransport):
                         pending_events.clear()
                         yield event
                 return
+            except MidStreamDisconnectError as e:
+                logger.warning(
+                    "NIM_STREAM:{} mid-stream disconnect, auto-resuming on key #{}/{}",
+                    req_tag,
+                    attempt_idx + 1,
+                    len(rr_order),
+                )
+                import copy
+
+                try:
+                    current_request = current_request.model_copy(deep=True)
+                except AttributeError:
+                    current_request = copy.deepcopy(current_request)
+
+                content_str = e.accumulated_text
+                if e.accumulated_reasoning:
+                    content_str = f"Here is my thinking process:\n{e.accumulated_reasoning}\n\n{content_str}"
+
+                # Append the assistant's partial response so far to resume generation
+                try:
+                    current_request.messages.append(
+                        {"role": "assistant", "content": content_str}
+                    )
+                except Exception as append_err:
+                    logger.error("Failed to auto-resume stream: {}", append_err)
+                    raise e.original_exc from e
+
+                is_resume = True
+                if attempt_idx == len(rr_order) - 1:
+                    raise e.original_exc from e
+                continue
             except self._RETRYABLE_EXC:
                 logger.warning(
                     "NIM_STREAM:{} transport error on key #{}/{}, advancing",
@@ -795,6 +836,8 @@ class NvidiaNimProvider(OpenAIChatTransport):
                     attempt_idx + 1,
                     len(rr_order),
                 )
+                if attempt_idx == len(rr_order) - 1:
+                    raise
                 continue
             finally:
                 _nim_active_client.reset(token)
