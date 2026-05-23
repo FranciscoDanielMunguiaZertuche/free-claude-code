@@ -322,7 +322,7 @@ class OpenAIChatTransport(BaseProvider):
                     yield sse.emit_tool_delta(tool_index, restored)
                 else:
                     rescue = SSEBuilder._rescue_partial_json(cleaned_args)
-                    yield sse.emit_tool_delta(tool_index, rescue)
+                    yield sse.emit_tool_delta(tool_index, cleaned_args + rescue)
             else:
                 try:
                     import json
@@ -331,7 +331,7 @@ class OpenAIChatTransport(BaseProvider):
                     yield sse.emit_tool_delta(tool_index, cleaned_args)
                 except Exception:
                     rescue = SSEBuilder._rescue_partial_json(cleaned_args)
-                    yield sse.emit_tool_delta(tool_index, rescue)
+                    yield sse.emit_tool_delta(tool_index, cleaned_args + rescue)
 
             tool_argument_alias_buffers.pop(tool_index, None)
 
