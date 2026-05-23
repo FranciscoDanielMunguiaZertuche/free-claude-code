@@ -117,9 +117,15 @@ class MidStreamDisconnectError(Exception):
     """Raised internally when a network error drops the connection mid-stream."""
 
     def __init__(
-        self, accumulated_text: str, accumulated_reasoning: str, original_exc: Exception
+        self,
+        accumulated_text: str,
+        accumulated_reasoning: str,
+        original_exc: Exception,
+        *,
+        has_emitted_tool_block: bool = False,
     ):
         super().__init__(str(original_exc))
         self.accumulated_text = accumulated_text
         self.accumulated_reasoning = accumulated_reasoning
         self.original_exc = original_exc
+        self.has_emitted_tool_block = has_emitted_tool_block

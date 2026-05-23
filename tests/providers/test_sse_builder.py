@@ -1,12 +1,13 @@
 """Tests for core.anthropic.sse."""
 
+import json
 from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
 
 from core.anthropic import ContentBlockManager, SSEBuilder, map_stop_reason
-from core.anthropic.sse import ToolCallState
+from core.anthropic.sse import ToolCallState, _strip_markdown_fences
 from core.anthropic.stream_contracts import parse_sse_text
 
 
@@ -417,3 +418,163 @@ class TestSSEBuilderTokenEstimation:
             tokens = builder.estimate_output_tokens()
             # 1 tool * 50 = 50
             assert tokens == 50
+
+
+class TestStripMarkdownFences:
+    """Tests for _strip_markdown_fences helper."""
+
+    def test_no_fences(self):
+        text, prefix = _strip_markdown_fences('{"key": "val"}')
+        assert text == '{"key": "val"}'
+        assert prefix == 0
+
+    def test_json_fence(self):
+        text, prefix = _strip_markdown_fences('```json\n{"key": "val"}\n```')
+        assert text == '{"key": "val"}'
+        assert prefix >= 7
+
+    def test_plain_fence(self):
+        text, prefix = _strip_markdown_fences('```\n{"key": "val"}\n```')
+        assert text == '{"key": "val"}'
+        assert prefix >= 3
+
+    def test_trailing_fence_only(self):
+        text, _prefix = _strip_markdown_fences('{"key": "val"}```')
+        assert text == '{"key": "val"}'
+
+    def test_leading_whitespace(self):
+        text, prefix = _strip_markdown_fences('  ```json\n{"key": "val"}\n``` ')
+        assert text == '{"key": "val"}'
+        assert prefix >= 2
+
+    def test_empty_string(self):
+        text, _prefix = _strip_markdown_fences("")
+        assert text == ""
+
+
+class TestRescuePartialJson:
+    """Tests for SSEBuilder._rescue_partial_json with real NIM scenarios."""
+
+    def test_complete_json_unchanged(self):
+        suffix = SSEBuilder._rescue_partial_json('{"key": "val"}')
+        assert json.loads('{"key": "val"}' + suffix) is not None
+
+    def test_unclosed_string(self):
+        partial = '{"command": "ls -la'
+        suffix = SSEBuilder._rescue_partial_json(partial)
+        assert json.loads(partial + suffix) is not None
+
+    def test_unclosed_object(self):
+        partial = '{"command": "ls -la"'
+        suffix = SSEBuilder._rescue_partial_json(partial)
+        assert json.loads(partial + suffix) is not None
+
+    def test_mid_value_string(self):
+        partial = '{"filePath": "/home/jferm/ten'
+        suffix = SSEBuilder._rescue_partial_json(partial)
+        result = json.loads(partial + suffix)
+        assert isinstance(result, dict)
+
+    def test_mid_key(self):
+        partial = '{"command": "ls", "de'
+        suffix = SSEBuilder._rescue_partial_json(partial)
+        result = json.loads(partial + suffix)
+        assert isinstance(result, dict)
+
+    def test_trailing_comma(self):
+        partial = '{"command": "ls",'
+        suffix = SSEBuilder._rescue_partial_json(partial)
+        result = json.loads(partial + suffix)
+        assert isinstance(result, dict)
+
+    def test_trailing_colon(self):
+        partial = '{"command":'
+        suffix = SSEBuilder._rescue_partial_json(partial)
+        result = json.loads(partial + suffix)
+        assert isinstance(result, dict)
+
+    def test_empty_string(self):
+        suffix = SSEBuilder._rescue_partial_json("")
+        result = json.loads(suffix)
+        assert result == {"_interrupted": True}
+
+    def test_just_open_brace(self):
+        partial = "{"
+        suffix = SSEBuilder._rescue_partial_json(partial)
+        result = json.loads(partial + suffix)
+        assert isinstance(result, dict)
+
+    def test_nim_typical_partial(self):
+        """Simulate a typical NIM mid-stream disconnect during tool call."""
+        partial = '{"command": "adb -s 192.168.240.112:5555 shell am start -a android'
+        suffix = SSEBuilder._rescue_partial_json(partial)
+        result = json.loads(partial + suffix)
+        assert isinstance(result, dict)
+
+    def test_markdown_wrapped_partial(self):
+        """NIM sometimes wraps tool args in markdown fences."""
+        partial = '{"filePath": "/home/jferm/tendo/apps'
+        suffix = SSEBuilder._rescue_partial_json(partial)
+        result = json.loads(partial + suffix)
+        assert isinstance(result, dict)
+
+    def test_deeply_nested_partial(self):
+        partial = '{"input": {"nested": {"key": "val'
+        suffix = SSEBuilder._rescue_partial_json(partial)
+        result = json.loads(partial + suffix)
+        assert isinstance(result, dict)
+
+
+class TestCloseIncompleteToolBlocks:
+    """Tests for SSEBuilder.close_incomplete_tool_blocks with markdown fences."""
+
+    def test_valid_json_no_rescue(self):
+        builder = SSEBuilder("msg_1", "model")
+        builder.start_tool_block(0, "t1", "Read")
+        builder.emit_tool_delta(0, '{"filePath": "/tmp/x"}')
+        events = list(builder.close_incomplete_tool_blocks())
+        assert events == []
+
+    def test_invalid_json_rescues(self):
+        builder = SSEBuilder("msg_1", "model")
+        builder.start_tool_block(0, "t1", "Read")
+        builder.emit_tool_delta(0, '{"filePath": "/home/jferm/ten')
+        events = list(builder.close_incomplete_tool_blocks())
+        assert len(events) == 1
+        state = builder.blocks.tool_states[0]
+        repaired = "".join(state.contents)
+        assert json.loads(repaired) is not None
+
+    def test_markdown_fence_rescue(self):
+        """Tool args wrapped in markdown fences must be rescued properly."""
+        builder = SSEBuilder("msg_1", "model")
+        builder.start_tool_block(0, "t1", "Bash")
+        builder.emit_tool_delta(0, '```json\n{"command": "ls -la')
+        events = list(builder.close_incomplete_tool_blocks())
+        assert len(events) == 1
+        state = builder.blocks.tool_states[0]
+        repaired = "".join(state.contents)
+        assert json.loads(repaired) is not None
+
+    def test_markdown_fence_with_trailing_fence(self):
+        builder = SSEBuilder("msg_1", "model")
+        builder.start_tool_block(0, "t1", "Write")
+        builder.emit_tool_delta(0, '```json\n{"path": "/tmp/test.txt')
+        builder.emit_tool_delta(0, ",\n```")
+        events = list(builder.close_incomplete_tool_blocks())
+        assert len(events) == 1
+        state = builder.blocks.tool_states[0]
+        repaired = "".join(state.contents)
+        assert json.loads(repaired) is not None
+
+    def test_mid_stream_disconnect_typical_scenario(self):
+        """Simulate the exact scenario from the bug report: NIM peer close."""
+        builder = SSEBuilder("msg_1", "model")
+        builder.start_tool_block(0, "t1", "Bash")
+        builder.emit_tool_delta(0, '{"command": "adb -s 192.168.240.112:5555 shell ')
+        events = list(builder.close_incomplete_tool_blocks())
+        assert len(events) == 1
+        state = builder.blocks.tool_states[0]
+        repaired = "".join(state.contents)
+        result = json.loads(repaired)
+        assert "command" in result

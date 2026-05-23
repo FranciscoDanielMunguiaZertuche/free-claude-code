@@ -20,6 +20,7 @@ from core.anthropic import (
     HeuristicToolParser,
     SSEBuilder,
     ThinkTagParser,
+    _strip_markdown_fences,
     append_request_id,
     map_stop_reason,
 )
@@ -302,14 +303,7 @@ class OpenAIChatTransport(BaseProvider):
             state = sse.blocks.tool_states.get(tool_index)
             if state is None or state.name == "Task":
                 continue
-            cleaned_args = buffered_args.strip()
-            if cleaned_args.startswith("```json"):
-                cleaned_args = cleaned_args[7:]
-            elif cleaned_args.startswith("```"):
-                cleaned_args = cleaned_args[3:]
-            if cleaned_args.endswith("```"):
-                cleaned_args = cleaned_args[:-3]
-            cleaned_args = cleaned_args.strip()
+            cleaned_args, _prefix_len = _strip_markdown_fences(buffered_args)
 
             aliases = (
                 tool_argument_aliases.get(state.name, {})
@@ -322,7 +316,15 @@ class OpenAIChatTransport(BaseProvider):
                     yield sse.emit_tool_delta(tool_index, restored)
                 else:
                     rescue = SSEBuilder._rescue_partial_json(cleaned_args)
-                    yield sse.emit_tool_delta(tool_index, cleaned_args + rescue)
+                    repaired = cleaned_args + rescue
+                    logger.warning(
+                        "TOOL_ALIAS_RESCUE: tool_id={} name={} len={}",
+                        state.tool_id or "unknown",
+                        state.name or "unknown",
+                        len(repaired),
+                    )
+                    state.contents = [repaired]
+                    yield sse.emit_tool_delta(tool_index, repaired)
             else:
                 try:
                     import json
@@ -331,7 +333,15 @@ class OpenAIChatTransport(BaseProvider):
                     yield sse.emit_tool_delta(tool_index, cleaned_args)
                 except Exception:
                     rescue = SSEBuilder._rescue_partial_json(cleaned_args)
-                    yield sse.emit_tool_delta(tool_index, cleaned_args + rescue)
+                    repaired = cleaned_args + rescue
+                    logger.warning(
+                        "TOOL_ARG_RESCUE: tool_id={} name={} len={}",
+                        state.tool_id or "unknown",
+                        state.name or "unknown",
+                        len(repaired),
+                    )
+                    state.contents = [repaired]
+                    yield sse.emit_tool_delta(tool_index, repaired)
 
             tool_argument_alias_buffers.pop(tool_index, None)
 
@@ -506,11 +516,16 @@ class OpenAIChatTransport(BaseProvider):
                         ConnectionError,
                         httpx.ConnectTimeout,
                     ),
-                ) and (sse.accumulated_text or sse.accumulated_reasoning):
+                ) and (
+                    sse.accumulated_text
+                    or sse.accumulated_reasoning
+                    or sse.blocks.has_emitted_tool_block()
+                ):
                     raise MidStreamDisconnectError(
                         accumulated_text=sse.accumulated_text,
                         accumulated_reasoning=sse.accumulated_reasoning,
                         original_exc=e,
+                        has_emitted_tool_block=sse.blocks.has_emitted_tool_block(),
                     ) from e
                 self._log_stream_transport_error(tag, req_tag, e, request_id=request_id)
                 mapped_e = map_error(e, rate_limiter=self._global_rate_limiter)

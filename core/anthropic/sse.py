@@ -164,6 +164,35 @@ def _normalize_task_run_in_background(args_json: dict) -> None:
         args_json["run_in_background"] = False
 
 
+def _strip_markdown_fences(text: str) -> tuple[str, int]:
+    """Strip markdown code fences from tool argument text.
+
+    Some models (especially NIM with reasoning) wrap tool JSON in
+    `````json ... ````` fences. This strips them so JSON parsing/rescue
+    can work on the raw JSON inside.
+
+    Returns (cleaned_text, prefix_length) where prefix_length is the
+    byte offset of the JSON start within the original text, so callers
+    can compute rescue suffixes relative to the cleaned text.
+    """
+    stripped = text.strip()
+    prefix_len = len(text) - len(text.lstrip())
+
+    if stripped.startswith("```json"):
+        prefix_len += 7
+        stripped = stripped[7:]
+    elif stripped.startswith("```"):
+        prefix_len += 3
+        stripped = stripped[3:]
+
+    stripped = stripped.lstrip("\n")
+    if stripped.endswith("```"):
+        stripped = stripped[:-3]
+    stripped = stripped.rstrip("\n ")
+
+    return stripped, prefix_len
+
+
 class SSEBuilder:
     """Builder for Anthropic SSE streaming events."""
 
@@ -395,13 +424,40 @@ class SSEBuilder:
             concatenated = "".join(state.contents)
             if not concatenated.strip():
                 continue
+            cleaned, _prefix_len = _strip_markdown_fences(concatenated)
             try:
-                json.loads(concatenated)
+                json.loads(cleaned)
                 continue
             except json.JSONDecodeError, ValueError:
                 pass
-            rescue = self._rescue_partial_json(concatenated)
-            state.contents.append(rescue)
+            # Rescue the cleaned text (markdown-stripped). The rescue
+            # suffix is computed relative to cleaned, but we must emit
+            # it so that concatenating ALL contents (including markdown)
+            # plus the rescue produces something that, after Claude Code
+            # strips markdown, parses as valid JSON.  The simplest
+            # approach: replace the contents list with just [cleaned + rescue]
+            # so downstream concatenation is clean.
+            rescue = self._rescue_partial_json(cleaned)
+            repaired = cleaned + rescue
+            try:
+                json.loads(repaired)
+            except json.JSONDecodeError, ValueError:
+                logger.warning(
+                    "TOOL_RESCUE_FAILED: tool_id={} len={} — rescue '{}' "
+                    "did not produce valid JSON",
+                    state.tool_id or "unknown",
+                    len(cleaned),
+                    rescue[:80],
+                )
+            else:
+                logger.debug(
+                    "TOOL_RESCUE_OK: tool_id={} name={} len={}→{}",
+                    state.tool_id or "unknown",
+                    state.name or "unknown",
+                    len(concatenated),
+                    len(repaired),
+                )
+            state.contents = [repaired]
             yield self.content_block_delta(
                 state.block_index, "input_json_delta", rescue
             )
@@ -414,8 +470,8 @@ class SSEBuilder:
         1. Close any unterminated string literal.
         2. Close all open braces/brackets in reverse nesting order.
         3. If the result still isn't valid JSON, fall back to
-        {"_interrupted": true} sent as a fresh delta (prefixed with
-        enough closing chars to terminate the old partial).
+        ``{"_interrupted": true}`` — closing all open structures first
+        then emitting the fallback as a complete replacement delta.
         """
         s = partial.strip()
         if not s:
@@ -444,16 +500,23 @@ class SSEBuilder:
                 open_stack.pop()
 
         suffix = ""
+        was_in_string = in_string
         if in_string:
             suffix += '"'
 
         candidate = s + suffix
-        if open_stack and open_stack[-1] == "}" and not in_string:
+        if open_stack and open_stack[-1] == "}":
             stripped = candidate.rstrip()
             if stripped.endswith(":"):
                 suffix += " null"
             elif stripped.endswith(","):
                 suffix += '"_truncated": null'
+            elif was_in_string and stripped.endswith('"'):
+                # Mid-key string: "de" + '"' → "de" — needs ": null"
+                # Check if this looks like a key (preceded by , or {)
+                before = s[: s.rfind('"')].rstrip()
+                if before.endswith(",") or before.endswith("{"):
+                    suffix += ": null"
 
         for bracket in reversed(open_stack):
             suffix += bracket
@@ -466,14 +529,59 @@ class SSEBuilder:
             pass
 
         close_brackets = "".join(reversed(open_stack))
-        candidate2 = s + ('"' if in_string else "") + " null" + close_brackets
+        if was_in_string:
+            before = s[: s.rfind('"')].rstrip()
+            if before.endswith(",") or before.endswith("{"):
+                candidate2 = s + '"' + ": null" + close_brackets
+            else:
+                candidate2 = s + '"' + " null" + close_brackets
+        else:
+            candidate2 = s + " null" + close_brackets
         try:
             json.loads(candidate2)
             return candidate2[len(s) :]
         except json.JSONDecodeError, ValueError:
             pass
 
-        return '{"_interrupted": true}'
+        # Final fallback: inject _interrupted key before closing
+        # so partial + suffix forms one valid JSON object.
+        truncation = ""
+        if in_string:
+            truncation += '"'
+        truncation += ',"_interrupted": true'
+        for bracket in reversed(open_stack):
+            truncation += bracket
+
+        candidate3 = s + truncation
+        try:
+            json.loads(candidate3)
+            return truncation
+        except json.JSONDecodeError, ValueError:
+            pass
+
+        # Absolute last resort — force-close with enough brackets to
+        # make the concatenation parseable. The brace tracker may have
+        # lost sync (broken escapes, interleaved markdown, etc) so we
+        # count raw opens/closes instead.
+        raw_opens = s.count("{") - s.count("}")
+        raw_bracket_opens = s.count("[") - s.count("]")
+        rescue = ""
+        if in_string:
+            rescue += '"'
+        if raw_opens > 0:
+            rescue += ',"_interrupted": true'
+            rescue += "}" * raw_opens
+        if raw_bracket_opens > 0:
+            rescue += "]" * raw_bracket_opens
+        # If nothing was open, wrap in a fallback object
+        if not rescue.strip():
+            rescue = "}}"
+        # Verify — if this still doesn't parse, return the nuclear option
+        try:
+            json.loads(s + rescue)
+            return rescue
+        except json.JSONDecodeError, ValueError:
+            return "}}"
 
     def close_all_blocks(self) -> Iterator[str]:
         yield from self.close_content_blocks()
