@@ -114,6 +114,9 @@ class Settings(BaseSettings):
     # ==================== Cerebras Inference (OpenAI-compatible) ====================
     cerebras_api_key: str = Field(default="", validation_alias="CEREBRAS_API_KEY")
 
+    # ==================== Logfare Config ====================
+    logfare_api_key: str = Field(default="", validation_alias="LOGFARE_API_KEY")
+
     # ==================== Messaging Platform Selection ====================
     # Valid: "telegram" | "discord" | "none"
     messaging_platform: str = Field(
@@ -157,6 +160,8 @@ class Settings(BaseSettings):
     model_opus: str | None = Field(default=None, validation_alias="MODEL_OPUS")
     model_sonnet: str | None = Field(default=None, validation_alias="MODEL_SONNET")
     model_haiku: str | None = Field(default=None, validation_alias="MODEL_HAIKU")
+    # Vision model used when request contains image blocks (falls back to MODEL)
+    model_vision: str | None = Field(default=None, validation_alias="MODEL_VISION")
 
     # ==================== Per-Provider Proxy ====================
     nvidia_nim_proxy: str = Field(default="", validation_alias="NVIDIA_NIM_PROXY")
@@ -174,6 +179,7 @@ class Settings(BaseSettings):
     gemini_proxy: str = Field(default="", validation_alias="GEMINI_PROXY")
     groq_proxy: str = Field(default="", validation_alias="GROQ_PROXY")
     cerebras_proxy: str = Field(default="", validation_alias="CEREBRAS_PROXY")
+    logfare_proxy: str = Field(default="", validation_alias="LOGFARE_PROXY")
 
     # ==================== Provider Rate Limiting ====================
     provider_rate_limit: int = Field(default=40, validation_alias="PROVIDER_RATE_LIMIT")
@@ -312,6 +318,7 @@ class Settings(BaseSettings):
         "model_opus",
         "model_sonnet",
         "model_haiku",
+        "model_vision",
         "enable_opus_thinking",
         "enable_sonnet_thinking",
         "enable_haiku_thinking",
@@ -397,7 +404,9 @@ class Settings(BaseSettings):
             )
         return v
 
-    @field_validator("model", "model_opus", "model_sonnet", "model_haiku")
+    @field_validator(
+        "model", "model_opus", "model_sonnet", "model_haiku", "model_vision"
+    )
     @classmethod
     def validate_model_format(cls, v: str | None) -> str | None:
         if v is None:
@@ -473,6 +482,7 @@ class Settings(BaseSettings):
             ("MODEL_OPUS", self.model_opus),
             ("MODEL_SONNET", self.model_sonnet),
             ("MODEL_HAIKU", self.model_haiku),
+            ("MODEL_VISION", self.model_vision),
         )
         sources_by_ref: dict[str, list[str]] = {}
         for source, model_ref in candidates:

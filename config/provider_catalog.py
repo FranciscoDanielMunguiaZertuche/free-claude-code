@@ -36,6 +36,7 @@ ZAI_DEFAULT_BASE = "https://api.z.ai/api/anthropic/v1"
 GEMINI_DEFAULT_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
 GROQ_DEFAULT_BASE = "https://api.groq.com/openai/v1"
 CEREBRAS_DEFAULT_BASE = "https://api.cerebras.ai/v1"
+LOGFARE_DEFAULT_BASE = "https://logfare.ai/v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +179,16 @@ PROVIDER_CATALOG: dict[str, ProviderDescriptor] = {
         credential_attr="groq_api_key",
         default_base_url=GROQ_DEFAULT_BASE,
         proxy_attr="groq_proxy",
+        capabilities=("chat", "streaming", "tools", "thinking", "rate_limit"),
+    ),
+    "logfare": ProviderDescriptor(
+        provider_id="logfare",
+        transport_type="openai_chat",
+        credential_env="LOGFARE_API_KEY",
+        credential_url="https://logfare.ai",
+        credential_attr="logfare_api_key",
+        default_base_url=LOGFARE_DEFAULT_BASE,
+        proxy_attr="logfare_proxy",
         capabilities=("chat", "streaming", "tools", "thinking", "rate_limit"),
     ),
     "fireworks": ProviderDescriptor(

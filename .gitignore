@@ -14,4 +14,4 @@ debug-*.log
 .coverage
 llama_cache
 .smoke-results
-.vscode
+.vscodeoh-my-pi/

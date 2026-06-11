@@ -200,3 +200,77 @@ def test_model_router_logs_mapping(settings):
     assert "MODEL MAPPING" in args[0]
     assert args[1] == "claude-2.1"
     assert args[2] == "fallback-model"
+
+
+def test_vision_routing_with_image_blocks(settings):
+    """When MODEL_VISION is set and request has images, route to vision model."""
+    from api.model_router import ModelRouter
+
+    settings.model_vision = "logfare/gemini-3.5-flash"
+    router = ModelRouter(settings)
+
+    from api.models.anthropic import Message, MessagesRequest
+
+    image_block = {
+        "type": "image",
+        "source": {"type": "url", "url": "https://example.com/img.png"},
+    }
+    request = MessagesRequest(
+        model="claude-sonnet-4-20250514",
+        messages=[
+            Message(role="user", content=[image_block]),
+        ],
+        max_tokens=1024,
+    )
+    routed = router.resolve_messages_request(request)
+    assert routed.resolved.provider_id == "logfare"
+    assert routed.resolved.provider_model == "gemini-3.5-flash"
+
+
+def test_vision_routing_text_only_uses_default(settings):
+    """When MODEL_VISION is set but request has no images, use default model."""
+    from api.model_router import ModelRouter
+
+    settings.model_vision = "logfare/gemini-3.5-flash"
+    router = ModelRouter(settings)
+
+    from api.models.anthropic import Message, MessagesRequest
+
+    request = MessagesRequest(
+        model="claude-sonnet-4-20250514",
+        messages=[
+            Message(role="user", content="Hello"),
+        ],
+        max_tokens=1024,
+    )
+    routed = router.resolve_messages_request(request)
+    # Should NOT use vision model
+    assert routed.resolved.provider_id != "logfare"
+
+
+def test_request_has_images_detects_image_dict():
+    from api.model_router import _request_has_images
+    from api.models.anthropic import Message, MessagesRequest
+
+    image_block = {
+        "type": "image",
+        "source": {"type": "url", "url": "https://x.com/img.png"},
+    }
+    request = MessagesRequest(
+        model="claude-sonnet",
+        messages=[Message(role="user", content=[image_block])],
+        max_tokens=1024,
+    )
+    assert _request_has_images(request) is True
+
+
+def test_request_has_images_text_only():
+    from api.model_router import _request_has_images
+    from api.models.anthropic import Message, MessagesRequest
+
+    request = MessagesRequest(
+        model="claude-sonnet",
+        messages=[Message(role="user", content="Just text")],
+        max_tokens=1024,
+    )
+    assert _request_has_images(request) is False

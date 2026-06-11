@@ -168,6 +168,7 @@ def build_request_body(
             reasoning_replay=ReasoningReplayMode.REASONING_CONTENT
             if thinking_enabled
             else ReasoningReplayMode.DISABLED,
+            supports_images=True,
         )
     except OpenAIConversionError as exc:
         raise InvalidRequestError(str(exc)) from exc

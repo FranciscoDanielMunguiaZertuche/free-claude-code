@@ -13,6 +13,19 @@ from .gateway_model_ids import decode_gateway_model_id
 from .models.anthropic import MessagesRequest, TokenCountRequest
 
 
+def _request_has_images(request: MessagesRequest) -> bool:
+    """Return True if any message in the request contains image blocks."""
+    for msg in request.messages:
+        content = getattr(msg, "content", None)
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "image":
+                    return True
+                if hasattr(block, "type") and block.type == "image":
+                    return True
+    return False
+
+
 @dataclass(frozen=True, slots=True)
 class ResolvedModel:
     original_model: str
@@ -108,8 +121,15 @@ class ModelRouter:
     def resolve_messages_request(
         self, request: MessagesRequest
     ) -> RoutedMessagesRequest:
-        """Return an internal routed request context."""
-        resolved = self.resolve(request.model)
+        """Return an internal routed request context.
+
+        When MODEL_VISION is configured and the request contains image blocks,
+        the vision model is used instead of the default model.
+        """
+        model_name = request.model
+        if self._settings.model_vision and _request_has_images(request):
+            model_name = self._settings.model_vision
+        resolved = self.resolve(model_name)
         routed = request.model_copy(deep=True)
         routed.model = resolved.provider_model
         return RoutedMessagesRequest(request=routed, resolved=resolved)

@@ -16,6 +16,30 @@ class OpenAIConversionError(Exception):
     """Raised when Anthropic content cannot be converted to OpenAI chat without data loss."""
 
 
+_IMAGE_STRIPPED_TEXT = (
+    "[image omitted: this model does not support image inputs; "
+    "do NOT attempt to read image files, view screenshots, or use vision tools]"
+)
+
+
+def _convert_image_block_to_openai(block: Any) -> dict[str, Any]:
+    """Convert an Anthropic image block to an OpenAI image_url content part."""
+    source = get_block_attr(block, "source", {})
+    if isinstance(source, dict):
+        source_type = source.get("type", "")
+        media_type = source.get("media_type", "image/png")
+        data = source.get("data", "")
+        if source_type == "base64" and data:
+            url = f"data:{media_type};base64,{data}"
+        elif source_type == "url":
+            url = source.get("url", "")
+        else:
+            url = ""
+    else:
+        url = ""
+    return {"type": "image_url", "image_url": {"url": url}}
+
+
 class ReasoningReplayMode(StrEnum):
     """How assistant reasoning history is replayed to OpenAI-compatible providers."""
 
@@ -53,7 +77,9 @@ def _tool_input_schema(tool: Any) -> dict[str, Any]:
     return {"type": "object", "properties": {}}
 
 
-def _serialize_tool_result_content(tool_content: Any) -> str:
+def _serialize_tool_result_content(
+    tool_content: Any, *, supports_images: bool = False
+) -> str:
     """Serialize tool_result content for OpenAI ``role: tool`` messages (stable JSON for structured values)."""
     if tool_content is None:
         return ""
@@ -66,6 +92,12 @@ def _serialize_tool_result_content(tool_content: Any) -> str:
         for item in tool_content:
             if isinstance(item, dict) and item.get("type") == "text":
                 parts.append(str(item.get("text", "")))
+            elif (
+                isinstance(item, dict)
+                and item.get("type") == "image"
+                and supports_images
+            ):
+                parts.append("[image attached]")
             elif isinstance(item, dict):
                 parts.append(json.dumps(item, ensure_ascii=False))
             else:
@@ -148,12 +180,16 @@ def _deferred_post_tool_blocks(
     ]
 
 
-def _assert_no_forbidden_assistant_block(block: Any) -> None:
+def _assert_no_forbidden_assistant_block(
+    block: Any, *, supports_images: bool = False
+) -> None:
     block_type = get_block_type(block)
     if block_type == "image":
-        raise OpenAIConversionError(
-            "Assistant image blocks are not supported for OpenAI chat conversion."
-        )
+        if not supports_images:
+            raise OpenAIConversionError(
+                "Assistant image blocks are not supported for OpenAI chat conversion."
+            )
+        return
     if block_type in (
         "server_tool_use",
         "web_search_tool_result",
@@ -173,6 +209,7 @@ class AnthropicToOpenAIConverter:
         messages: list[Any],
         *,
         reasoning_replay: ReasoningReplayMode = ReasoningReplayMode.THINK_TAGS,
+        supports_images: bool = False,
     ) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
         pending: _PendingAfterTools | None = None
@@ -265,7 +302,9 @@ class AnthropicToOpenAIConverter:
                                 pending = None
                     else:
                         result.extend(
-                            AnthropicToOpenAIConverter._convert_user_message(content)
+                            AnthropicToOpenAIConverter._convert_user_message(
+                                content, supports_images=supports_images
+                            )
                         )
             else:
                 if role == "user" and pending is not None and pending.needs_deferred():
@@ -404,12 +443,17 @@ class AnthropicToOpenAIConverter:
 
     @staticmethod
     def _convert_user_message_with_injection(
-        content: list[Any], pending: _PendingAfterTools
+        content: list[Any],
+        pending: _PendingAfterTools,
+        *,
+        supports_images: bool = False,
     ) -> dict[str, Any]:
         """Convert user list blocks, emitting deferred assistant after all tool results."""
         if not pending.needs_deferred() or not pending.remaining_tool_ids:
             return {
-                "messages": AnthropicToOpenAIConverter._convert_user_message(content),
+                "messages": AnthropicToOpenAIConverter._convert_user_message(
+                    content, supports_images=supports_images
+                ),
                 "cleared_pending": False,
             }
 
@@ -427,15 +471,26 @@ class AnthropicToOpenAIConverter:
             if block_type == "text":
                 text_parts.append(get_block_attr(block, "text", ""))
             elif block_type == "image":
-                raise OpenAIConversionError(
-                    "User message image blocks are not supported for OpenAI chat "
-                    "conversion; use a vision-capable native Anthropic provider or "
-                    "extend the converter."
-                )
+                if supports_images:
+                    flush_text()
+                    result.append(
+                        {
+                            "role": "user",
+                            "content": [_convert_image_block_to_openai(block)],
+                        }
+                    )
+                else:
+                    raise OpenAIConversionError(
+                        "User message image blocks are not supported for OpenAI chat "
+                        "conversion; use a vision-capable native Anthropic provider or "
+                        "extend the converter."
+                    )
             elif block_type == "tool_result":
                 flush_text()
                 tool_content = get_block_attr(block, "content", "")
-                serialized = _serialize_tool_result_content(tool_content)
+                serialized = _serialize_tool_result_content(
+                    tool_content, supports_images=supports_images
+                )
                 tuid = get_block_attr(block, "tool_use_id")
                 tuid_s = str(tuid) if tuid is not None else ""
                 result.append(
@@ -462,14 +517,28 @@ class AnthropicToOpenAIConverter:
         return {"messages": result, "cleared_pending": cleared}
 
     @staticmethod
-    def _convert_user_message(content: list[Any]) -> list[dict[str, Any]]:
+    def _convert_user_message(
+        content: list[Any], *, supports_images: bool = False
+    ) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
         text_parts: list[str] = []
+        image_parts: list[dict[str, Any]] = []
 
         def flush_text() -> None:
             if text_parts:
                 result.append({"role": "user", "content": "\n".join(text_parts)})
                 text_parts.clear()
+
+        def flush_mixed() -> None:
+            if not text_parts and not image_parts:
+                return
+            parts: list[dict[str, Any]] = [
+                {"type": "text", "text": t} for t in text_parts
+            ]
+            parts.extend(image_parts)
+            result.append({"role": "user", "content": parts})
+            text_parts.clear()
+            image_parts.clear()
 
         for block in content:
             block_type = get_block_type(block)
@@ -477,15 +546,23 @@ class AnthropicToOpenAIConverter:
             if block_type == "text":
                 text_parts.append(get_block_attr(block, "text", ""))
             elif block_type == "image":
-                raise OpenAIConversionError(
-                    "User message image blocks are not supported for OpenAI chat "
-                    "conversion; use a vision-capable native Anthropic provider or "
-                    "extend the converter."
-                )
+                if supports_images:
+                    image_parts.append(_convert_image_block_to_openai(block))
+                else:
+                    raise OpenAIConversionError(
+                        "User message image blocks are not supported for OpenAI chat "
+                        "conversion; use a vision-capable native Anthropic provider or "
+                        "extend the converter."
+                    )
             elif block_type == "tool_result":
-                flush_text()
+                if image_parts:
+                    flush_mixed()
+                else:
+                    flush_text()
                 tool_content = get_block_attr(block, "content", "")
-                serialized = _serialize_tool_result_content(tool_content)
+                serialized = _serialize_tool_result_content(
+                    tool_content, supports_images=supports_images
+                )
                 result.append(
                     {
                         "role": "tool",
@@ -494,7 +571,10 @@ class AnthropicToOpenAIConverter:
                     }
                 )
 
-        flush_text()
+        if image_parts:
+            flush_mixed()
+        else:
+            flush_text()
         return result
 
     @staticmethod
@@ -550,12 +630,14 @@ def build_base_request_body(
     *,
     default_max_tokens: int | None = None,
     reasoning_replay: ReasoningReplayMode = ReasoningReplayMode.THINK_TAGS,
+    supports_images: bool = False,
 ) -> dict[str, Any]:
     """Build the common parts of an OpenAI-format request body."""
     _openai_reject_native_only_top_level_fields(request_data)
     messages = AnthropicToOpenAIConverter.convert_messages(
         request_data.messages,
         reasoning_replay=reasoning_replay,
+        supports_images=supports_images,
     )
 
     system = getattr(request_data, "system", None)

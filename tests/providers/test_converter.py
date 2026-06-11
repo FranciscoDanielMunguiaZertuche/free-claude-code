@@ -591,6 +591,38 @@ def test_convert_user_message_image_raises():
         AnthropicToOpenAIConverter.convert_messages(messages)
 
 
+def test_convert_user_message_image_with_supports_images():
+    content = [
+        MockBlock(type="image", source={"type": "url", "url": "https://example.com/x"})
+    ]
+    messages = [MockMessage("user", content)]
+    result = AnthropicToOpenAIConverter.convert_messages(messages, supports_images=True)
+    assert len(result) == 1
+    assert result[0]["role"] == "user"
+    parts = result[0]["content"]
+    assert len(parts) == 1
+    assert parts[0]["type"] == "image_url"
+    assert parts[0]["image_url"]["url"] == "https://example.com/x"
+
+
+def test_convert_user_message_base64_image_with_supports_images():
+    content = [
+        MockBlock(
+            type="image",
+            source={
+                "type": "base64",
+                "media_type": "image/png",
+                "data": "iVBORw0KGgo=",
+            },
+        )
+    ]
+    messages = [MockMessage("user", content)]
+    result = AnthropicToOpenAIConverter.convert_messages(messages, supports_images=True)
+    assert len(result) == 1
+    parts = result[0]["content"]
+    assert parts[0]["image_url"]["url"].startswith("data:image/png;base64,")
+
+
 def test_convert_assistant_text_after_tool_use_splits_for_openai_chat():
     """Post-tool_use assistant text is replayed as a second assistant turn (issue 206)."""
     content = [

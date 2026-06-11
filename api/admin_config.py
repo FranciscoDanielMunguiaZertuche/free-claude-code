@@ -252,6 +252,14 @@ FIELDS: tuple[ConfigFieldSpec, ...] = (
         ),
     ),
     ConfigFieldSpec(
+        "LOGFARE_API_KEY",
+        "Logfare API Key",
+        "providers",
+        "secret",
+        settings_attr="logfare_api_key",
+        secret=True,
+    ),
+    ConfigFieldSpec(
         "LM_STUDIO_BASE_URL",
         "LM Studio Base URL",
         "providers",
@@ -404,6 +412,15 @@ FIELDS: tuple[ConfigFieldSpec, ...] = (
         "providers",
         "secret",
         settings_attr="cerebras_proxy",
+        secret=True,
+        advanced=True,
+    ),
+    ConfigFieldSpec(
+        "LOGFARE_PROXY",
+        "Logfare Proxy",
+        "providers",
+        "secret",
+        settings_attr="logfare_proxy",
         secret=True,
         advanced=True,
     ),
@@ -894,6 +911,12 @@ FIELDS: tuple[ConfigFieldSpec, ...] = (
     ConfigFieldSpec(
         "FCC_SMOKE_MODEL_CEREBRAS",
         "Smoke Cerebras Model",
+        "smoke",
+        advanced=True,
+    ),
+    ConfigFieldSpec(
+        "FCC_SMOKE_MODEL_LOGFARE",
+        "Smoke Logfare Model",
         "smoke",
         advanced=True,
     ),
